@@ -1,7 +1,8 @@
-import { Command } from 'commander';
+import confirm from '@inquirer/confirm';
+import type { Command } from 'commander';
 import logger from '../logger';
 import telemetry from '../telemetry';
-import { deleteEval, getEvalFromId, setupEnv } from '../util';
+import { deleteAllEvals, deleteEval, getEvalFromId, getLatestEval, setupEnv } from '../util';
 
 async function handleEvalDelete(evalId: string, envPath?: string) {
   try {
@@ -13,14 +14,25 @@ async function handleEvalDelete(evalId: string, envPath?: string) {
   }
 }
 
+async function handleEvalDeleteAll() {
+  const confirmed = await confirm({
+    message:
+      'Are you sure you want to delete all stored evaluations? This action cannot be undone.',
+  });
+  if (!confirmed) {
+    return;
+  }
+  await deleteAllEvals();
+  logger.info('All evaluations have been deleted.');
+}
+
 export function deleteCommand(program: Command) {
   const deleteCommand = program
     .command('delete <id>')
     .description('Delete various resources')
-    .option('--env-path <path>', 'Path to the environment file')
+    .option('--env-file, --env-path <path>', 'Path to .env file')
     .action(async (id: string, cmdObj: { envPath?: string }) => {
       setupEnv(cmdObj.envPath);
-      telemetry.maybeShowNotice();
       telemetry.record('command_used', {
         name: 'delete',
       });
@@ -35,17 +47,29 @@ export function deleteCommand(program: Command) {
 
   deleteCommand
     .command('eval <id>')
-    .description('Delete an evaluation by ID.')
-    .option('--env-path <path>', 'Path to the environment file')
+    .description(
+      'Delete an evaluation by ID. Use "latest" to delete the most recent evaluation, or "all" to delete all evaluations.',
+    )
+    .option('--env-file, --env-path <path>', 'Path to .env file')
     .action(async (evalId, cmdObj) => {
       setupEnv(cmdObj.envPath);
-      telemetry.maybeShowNotice();
       telemetry.record('command_used', {
         name: 'delete eval',
-        evalId: evalId,
+        evalId,
       });
       await telemetry.send();
 
-      handleEvalDelete(evalId, cmdObj.envPath);
+      if (evalId === 'latest') {
+        const latestResults = await getLatestEval();
+        if (latestResults) {
+          await handleEvalDelete(latestResults.createdAt, cmdObj.envPath);
+        } else {
+          logger.error('No evaluations found.');
+        }
+      } else if (evalId === 'all') {
+        await handleEvalDeleteAll();
+      } else {
+        await handleEvalDelete(evalId, cmdObj.envPath);
+      }
     });
 }

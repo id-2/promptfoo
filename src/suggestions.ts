@@ -2,8 +2,6 @@ import { SUGGEST_PROMPTS_SYSTEM_MESSAGE } from './prompts';
 import { DefaultSuggestionsProvider } from './providers/openai';
 import type { TokenUsage } from './types';
 
-const DEFAULT_TEMPERATURE = 0.9;
-
 interface GeneratePromptsOutput {
   prompts?: string[];
   error?: string;
@@ -46,7 +44,7 @@ export async function generatePrompts(prompt: string, num: number): Promise<Gene
         completion: resp.tokenUsage?.completion || 0,
       },
     };
-  } catch (err) {
+  } catch {
     return {
       error: `Output is not valid JSON: ${resp.output}`,
       tokensUsed: {

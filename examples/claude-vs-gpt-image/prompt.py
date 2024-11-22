@@ -1,5 +1,6 @@
 import base64
 import typing
+
 import requests
 
 
@@ -54,7 +55,7 @@ def format_image_prompt(context: PromptFunctionContext) -> list[dict[str, typing
     """
     if (
         context["provider"]["id"].startswith("bedrock:anthropic")
-        or context["provider"]["id"] == "anthropic:messages:claude-3-5-sonnet-20240620"
+        or context["provider"]["id"] == "anthropic:messages:claude-3-5-sonnet-20241022"
     ):
         return [
             {"role": "system", "content": system_prompt},

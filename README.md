@@ -4,15 +4,16 @@
 [![npm](https://img.shields.io/npm/dm/promptfoo)](https://npmjs.com/package/promptfoo)
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/typpo/promptfoo/main.yml)](https://github.com/promptfoo/promptfoo/actions/workflows/main.yml)
 ![MIT license](https://img.shields.io/github/license/promptfoo/promptfoo)
-[![Discord](https://dcbadge.vercel.app/api/server/gHPS9jjfbs?style=flat&compact=true)](https://discord.gg/gHPS9jjfbs)
+[![Discord](https://github.com/user-attachments/assets/2092591a-ccc5-42a7-aeb6-24a2808950fd)](https://discord.gg/gHPS9jjfbs)
 
-`promptfoo` is a tool for testing and evaluating LLM apps.
+`promptfoo` is a tool for testing, evaluating, and red-teaming LLM apps.
 
 With promptfoo, you can:
 
 - **Build reliable prompts, models, and RAGs** with benchmarks specific to your use-case
+- **Secure your apps** with automated [red teaming](https://www.promptfoo.dev/docs/red-team/) and pentesting
 - **Speed up evaluations** with caching, concurrency, and live reloading
-- **Score outputs automatically** by defining [metrics](https://www.promptfoo.dev/docs/configuration/expected-outputs) and perform automated [red teaming](https://www.promptfoo.dev/docs/red-team/)
+- **Score outputs automatically** by defining [metrics](https://www.promptfoo.dev/docs/configuration/expected-outputs)
 - Use as a [CLI](https://www.promptfoo.dev/docs/usage/command-line), [library](https://www.promptfoo.dev/docs/usage/node-package), or in [CI/CD](https://www.promptfoo.dev/docs/integrations/github-action)
 - Use OpenAI, Anthropic, Azure, Google, HuggingFace, open-source models like Llama, or integrate custom API providers for [any LLM API](https://www.promptfoo.dev/docs/providers)
 
@@ -31,6 +32,10 @@ promptfoo produces matrix views that let you quickly evaluate outputs across man
 It works on the command line too:
 
 ![Prompt evaluation](https://github.com/promptfoo/promptfoo/assets/310310/480e1114-d049-40b9-bd5f-f81c15060284)
+
+It also produces high-level vulnerability and risk reports:
+
+![gen ai red team](https://www.promptfoo.dev/img/riskreport-1@2x.png)
 
 ## Why choose promptfoo?
 
@@ -54,7 +59,7 @@ As you collect more examples and establish a user feedback loop, continue to bui
 
 <img width="772" alt="LLM ops" src="https://github.com/promptfoo/promptfoo/assets/310310/cf0461a7-2832-4362-9fbb-4ebd911d06ff">
 
-## Usage
+## Usage - evals
 
 To get started, run this command:
 
@@ -62,13 +67,23 @@ To get started, run this command:
 npx promptfoo@latest init
 ```
 
-This will create some placeholders in your current directory: `prompts.txt` and `promptfooconfig.yaml`.
+This will create a `promptfooconfig.yaml` placeholder in your current directory.
 
 After editing the prompts and variables to your liking, run the eval command to kick off an evaluation:
 
 ```
 npx promptfoo@latest eval
 ```
+
+## Usage - red teaming/pentesting
+
+Run this command:
+
+```sh
+npx promptfoo@latest redteam init
+```
+
+This will ask you questions about what types of vulnerabilities you want to find and walk you through running your first scan.
 
 ### Configuration
 
@@ -77,8 +92,12 @@ The YAML configuration format runs each prompt through a series of example input
 See the [Configuration docs](https://www.promptfoo.dev/docs/configuration/guide) for a detailed guide.
 
 ```yaml
-prompts: [prompt1.txt, prompt2.txt]
-providers: [openai:gpt-3.5-turbo, ollama:llama2:70b]
+prompts:
+  - file://prompt1.txt
+  - file://prompt2.txt
+providers:
+  - openai:gpt-4o-mini
+  - ollama:llama3.1:70b
 tests:
   - description: 'Test translation to French'
     vars:
@@ -122,13 +141,17 @@ Deterministic eval metrics
 | `contains-json`                 | output contains valid json (optional json schema validation)      |
 | `is-sql`                        | output is valid sql                                               |
 | `contains-sql`                  | output contains valid sql                                         |
+| `is-xml`                        | output is valid xml                                               |
+| `contains-xml`                  | output contains valid xml                                         |
 | `javascript`                    | provided Javascript function validates the output                 |
 | `python`                        | provided Python function validates the output                     |
 | `webhook`                       | provided webhook returns `{pass: true}`                           |
-| `rouge-n`                       | Rouge-N score is above a given threshold                          |
+| `rouge-n`                       | Rouge-N score is above a given threshold (default 0.75)           |
+| `bleu`                          | BLEU score is above a given threshold (default 0.5)               |
 | `levenshtein`                   | Levenshtein distance is below a threshold                         |
 | `latency`                       | Latency is below a threshold (milliseconds)                       |
 | `perplexity`                    | Perplexity is below a threshold                                   |
+| `perplexity-score`              | Normalized perplexity                                             |
 | `cost`                          | Cost is below a threshold (for models with cost info such as GPT) |
 | `is-valid-openai-function-call` | Ensure that the function call matches the function's JSON schema  |
 | `is-valid-openai-tools-call`    | Ensure that all tool calls match the tools JSON schema            |
@@ -156,9 +179,11 @@ Every test type can be negated by prepending `not-`. For example, `not-equals` o
 Some people prefer to configure their LLM tests in a CSV. In that case, the config is pretty simple:
 
 ```yaml
-prompts: [prompts.txt]
-providers: [openai:gpt-3.5-turbo]
-tests: tests.csv
+prompts:
+  - file://prompts.txt
+providers:
+  - openai:gpt-4o-mini
+tests: file://tests.csv
 ```
 
 See [example CSV](https://github.com/promptfoo/promptfoo/blob/main/examples/simple-test/tests.csv).
@@ -193,7 +218,7 @@ npx promptfoo view
 In [this example](https://github.com/promptfoo/promptfoo/tree/main/examples/assistant-cli), we evaluate whether adding adjectives to the personality of an assistant bot affects the responses:
 
 ```
-npx promptfoo eval -p prompts.txt -r openai:gpt-3.5-turbo -t tests.csv
+npx promptfoo eval -p prompts.txt -r openai:gpt-4o-mini -t tests.csv
 ```
 
 <!--
@@ -210,15 +235,15 @@ You can also output a nice [spreadsheet](https://docs.google.com/spreadsheets/d/
 
 #### Model quality
 
-In the [next example](https://github.com/promptfoo/promptfoo/tree/main/examples/gpt-3.5-vs-4), we evaluate the difference between GPT 3 and GPT 4 outputs for a given prompt:
+In the [next example](https://github.com/promptfoo/promptfoo/tree/main/examples/gpt-4o-vs-4o-mini), we evaluate the difference between GPT 3 and GPT 4 outputs for a given prompt:
 
 ```
-npx promptfoo eval -p prompts.txt -r openai:gpt-3.5-turbo openai:gpt-4 -o output.html
+npx promptfoo eval -p prompts.txt -r openai:gpt-4o openai:gpt-4o-mini -o output.html
 ```
 
 Produces this HTML table:
 
-![Side-by-side evaluation of LLM model quality, gpt3 vs gpt4, html output](https://user-images.githubusercontent.com/310310/235490527-e0c31f40-00a0-493a-8afc-8ed6322bb5ca.png)
+![Side-by-side evaluation of LLM model quality, gpt-4o vs gpt-4o-mini, html output](https://user-images.githubusercontent.com/310310/235490527-e0c31f40-00a0-493a-8afc-8ed6322bb5ca.png)
 
 ## Usage (node package)
 
@@ -228,7 +253,7 @@ You can also use `promptfoo` as a library in your project by importing the `eval
 
   ```typescript
   interface EvaluateTestSuite {
-    providers: string[]; // Valid provider name (e.g. openai:gpt-3.5-turbo)
+    providers: string[]; // Valid provider name (e.g. openai:gpt-4o-mini)
     prompts: string[]; // List of prompts
     tests: string | TestCase[]; // Path to a CSV file, or list of test cases
 
@@ -284,7 +309,7 @@ import promptfoo from 'promptfoo';
 
 const results = await promptfoo.evaluate({
   prompts: ['Rephrase this in French: {{body}}', 'Rephrase this like a pirate: {{body}}'],
-  providers: ['openai:gpt-3.5-turbo'],
+  providers: ['openai:gpt-4o-mini'],
   tests: [
     {
       vars: {
@@ -311,7 +336,65 @@ See the full example [here](https://github.com/promptfoo/promptfoo/tree/main/exa
 
 ## Installation
 
-See **[installation docs](https://www.promptfoo.dev/docs/installation)**
+Requires Node.js 18 or newer.
+
+You can install promptfoo using npm, npx, Homebrew, or by cloning the repository.
+
+### npm (recommended)
+
+Install `promptfoo` globally:
+
+```sh
+npm install -g promptfoo
+```
+
+Or install it locally in your project:
+
+```sh
+npm install promptfoo
+```
+
+### npx
+
+Run promptfoo without installing it:
+
+```sh
+npx promptfoo@latest init
+```
+
+This will create a `promptfooconfig.yaml` placeholder in your current directory.
+
+### Homebrew
+
+If you prefer using Homebrew, you can install promptfoo with:
+
+```sh
+brew install promptfoo
+```
+
+### From source
+
+For the latest development version:
+
+```sh
+git clone https://github.com/promptfoo/promptfoo.git
+cd promptfoo
+npm install
+npm run build
+npm link
+```
+
+### Verify installation
+
+To verify that promptfoo is installed correctly, run:
+
+```sh
+promptfoo --version
+```
+
+This should display the version number of promptfoo.
+
+For more detailed installation instructions, including system requirements and troubleshooting, please visit our [installation guide](https://www.promptfoo.dev/docs/installation).
 
 ## API Providers
 
@@ -333,17 +416,7 @@ cd path/to/experiment-with-promptfoo   # contains your promptfooconfig.yaml
 npx path/to/promptfoo-source eval
 ```
 
-The web UI is located in `src/web/nextui`. To run it in dev mode, run `npm run local:web`. This will host the web UI at http://localhost:3000. The web UI expects `promptfoo view` to be running separately.
-
-In order to build the next.js app, you'll have to set some placeholder envars (it is _not_ necessary to sign up for a supabase account). You can edit `src/web/nextui/.env` to include the following placeholders:
-
-```sh
-DATABASE_URL="postgresql://..."
-
-NEXT_PUBLIC_PROMPTFOO_WITH_DATABASE=1
-NEXT_PUBLIC_SUPABASE_URL=https://placeholder.promptfoo.dev
-NEXT_PUBLIC_SUPABASE_ANON_KEY=abc123
-```
+The web UI is located in `src/app`. To run it in dev mode, run `npm run local:app`. This will host the web UI at http://localhost:3000. The web UI expects `promptfoo view` to be running separately.
 
 Then run:
 

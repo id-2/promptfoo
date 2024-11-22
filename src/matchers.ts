@@ -1,4 +1,5 @@
 import invariant from 'tiny-invariant';
+import cliState from './cliState';
 import logger from './logger';
 import {
   ANSWER_RELEVANCY_GENERATE,
@@ -15,6 +16,8 @@ import {
 } from './prompts';
 import { loadApiProvider } from './providers';
 import { getDefaultProviders } from './providers/defaults';
+import { shouldGenerateRemote } from './redteam/util';
+import { doRemoteGrading } from './remoteGrading';
 import type {
   ApiClassificationProvider,
   ApiEmbeddingProvider,
@@ -28,9 +31,11 @@ import type {
   ProviderType,
   ApiModerationProvider,
 } from './types';
-import { extractJsonObjects, getNunjucksEngine } from './util';
+import { maybeLoadFromExternalFile } from './util';
+import { extractJsonObjects } from './util/json';
+import { getNunjucksEngine } from './util/templates';
 
-const nunjucks = getNunjucksEngine();
+const nunjucks = getNunjucksEngine(undefined, false, true);
 
 function cosineSimilarity(vecA: number[], vecB: number[]) {
   if (vecA.length !== vecB.length) {
@@ -167,6 +172,7 @@ function fail(reason: string, tokensUsed?: Partial<TokenUsage>): Omit<GradingRes
       total: tokensUsed?.total || 0,
       prompt: tokensUsed?.prompt || 0,
       completion: tokensUsed?.completion || 0,
+      cached: tokensUsed?.cached || 0,
     },
   };
 }
@@ -178,6 +184,20 @@ export async function matchesSimilarity(
   inverse: boolean = false,
   grading?: GradingConfig,
 ): Promise<Omit<GradingResult, 'assertion'>> {
+  if (cliState.config?.redteam && shouldGenerateRemote()) {
+    try {
+      return doRemoteGrading({
+        task: 'similar',
+        expected,
+        output,
+        threshold,
+        inverse,
+      });
+    } catch (error) {
+      return fail(`Could not perform remote grading: ${error}`);
+    }
+  }
+
   const finalProvider = (await getAndCheckProvider(
     'embedding',
     grading?.provider,
@@ -190,6 +210,7 @@ export async function matchesSimilarity(
     total: 0,
     prompt: 0,
     completion: 0,
+    cached: 0,
   };
 
   if ('callSimilarityApi' in finalProvider) {
@@ -216,6 +237,8 @@ export async function matchesSimilarity(
       completion:
         (expectedEmbedding.tokenUsage?.completion || 0) +
         (outputEmbedding.tokenUsage?.completion || 0),
+      cached:
+        (expectedEmbedding.tokenUsage?.cached || 0) + (outputEmbedding.tokenUsage?.cached || 0),
     };
 
     if (expectedEmbedding.error || outputEmbedding.error) {
@@ -233,7 +256,9 @@ export async function matchesSimilarity(
   } else {
     throw new Error('Provider must implement callSimilarityApi or callEmbeddingApi');
   }
-  const pass = inverse ? similarity <= threshold : similarity >= threshold;
+  const pass = inverse
+    ? similarity <= threshold + Number.EPSILON
+    : similarity >= threshold - Number.EPSILON;
   const greaterThanReason = `Similarity ${similarity.toFixed(
     2,
   )} is greater than threshold ${threshold}`;
@@ -287,7 +312,7 @@ export async function matchesClassification(
     score = resp.classification[expected] || 0;
   }
 
-  if (score >= threshold) {
+  if (score >= threshold - Number.EPSILON) {
     const reason =
       expected === undefined
         ? `Maximum classification score ${score.toFixed(2)} >= ${threshold}`
@@ -305,9 +330,28 @@ export async function matchesClassification(
   };
 }
 
+export function renderLlmRubricPrompt(
+  rubric: string,
+  llmOutput: string,
+  grading?: GradingConfig,
+  vars?: Record<string, string | object>,
+) {
+  let rubricPrompt = grading?.rubricPrompt || DEFAULT_GRADING_PROMPT;
+
+  // Load from external file if the rubricPrompt starts with 'file://'
+  rubricPrompt = maybeLoadFromExternalFile(rubricPrompt);
+
+  invariant(typeof rubricPrompt === 'string', 'rubricPrompt must be a string');
+  return nunjucks.renderString(rubricPrompt, {
+    output: JSON.stringify(llmOutput).slice(1, -1),
+    rubric: JSON.stringify(rubric).slice(1, -1),
+    ...fromVars(vars),
+  });
+}
+
 export async function matchesLlmRubric(
-  expected: string,
-  output: string,
+  rubric: string,
+  llmOutput: string,
   grading?: GradingConfig,
   vars?: Record<string, string | object>,
 ): Promise<Omit<GradingResult, 'assertion'>> {
@@ -317,13 +361,16 @@ export async function matchesLlmRubric(
     );
   }
 
-  const rubricPrompt = grading?.rubricPrompt || DEFAULT_GRADING_PROMPT;
-  invariant(typeof rubricPrompt === 'string', 'rubricPrompt must be a string');
-  const prompt = nunjucks.renderString(rubricPrompt, {
-    output: JSON.stringify(output).slice(1, -1),
-    rubric: JSON.stringify(expected).slice(1, -1),
-    ...fromVars(vars),
-  });
+  if (!grading.rubricPrompt && cliState.config?.redteam && shouldGenerateRemote()) {
+    return doRemoteGrading({
+      task: 'llm-rubric',
+      rubric,
+      output: llmOutput,
+      vars: vars || {},
+    });
+  }
+
+  const prompt = renderLlmRubricPrompt(rubric, llmOutput, grading, vars);
 
   const defaultProviders = await getDefaultProviders();
   const defaultProvider =
@@ -355,6 +402,7 @@ export async function matchesLlmRubric(
         total: resp.tokenUsage?.total || 0,
         prompt: resp.tokenUsage?.prompt || 0,
         completion: resp.tokenUsage?.completion || 0,
+        cached: resp.tokenUsage?.cached || 0,
       },
     };
   } catch (err) {
@@ -453,6 +501,7 @@ export async function matchesFactuality(
         total: resp.tokenUsage?.total || 0,
         prompt: resp.tokenUsage?.prompt || 0,
         completion: resp.tokenUsage?.completion || 0,
+        cached: resp.tokenUsage?.cached || 0,
       },
     };
   } catch (err) {
@@ -495,11 +544,11 @@ export async function matchesClosedQa(
 
   invariant(typeof resp.output === 'string', 'model-graded-closedqa produced malformed response');
   try {
-    const pass = resp.output.endsWith('Y');
+    const pass = resp.output.trimEnd().endsWith('Y');
     let reason;
     if (pass) {
       reason = 'The submission meets the criterion';
-    } else if (resp.output.endsWith('N')) {
+    } else if (resp.output.trimEnd().endsWith('N')) {
       reason = `The submission does not meet the criterion:\n${resp.output}`;
     } else {
       reason = `Model grader produced a malformed response:\n${resp.output}`;
@@ -512,6 +561,7 @@ export async function matchesClosedQa(
         total: resp.tokenUsage?.total || 0,
         prompt: resp.tokenUsage?.prompt || 0,
         completion: resp.tokenUsage?.completion || 0,
+        cached: resp.tokenUsage?.cached || 0,
       },
     };
   } catch (err) {
@@ -542,6 +592,7 @@ export async function matchesAnswerRelevance(
     total: 0,
     prompt: 0,
     completion: 0,
+    cached: 0,
   };
 
   const candidateQuestions: string[] = [];
@@ -557,6 +608,7 @@ export async function matchesAnswerRelevance(
       tokensUsed.total += resp.tokenUsage?.total || 0;
       tokensUsed.prompt += resp.tokenUsage?.prompt || 0;
       tokensUsed.completion += resp.tokenUsage?.completion || 0;
+      tokensUsed.cached += resp.tokenUsage?.cached || 0;
       return fail(resp.error || 'No output', tokensUsed);
     }
 
@@ -577,6 +629,7 @@ export async function matchesAnswerRelevance(
     tokensUsed.total += inputEmbeddingResp.tokenUsage?.total || 0;
     tokensUsed.prompt += inputEmbeddingResp.tokenUsage?.prompt || 0;
     tokensUsed.completion += inputEmbeddingResp.tokenUsage?.completion || 0;
+    tokensUsed.cached += inputEmbeddingResp.tokenUsage?.cached || 0;
     return fail(inputEmbeddingResp.error || 'No embedding', tokensUsed);
   }
   const inputEmbedding = inputEmbeddingResp.embedding;
@@ -587,6 +640,7 @@ export async function matchesAnswerRelevance(
     tokensUsed.total += resp.tokenUsage?.total || 0;
     tokensUsed.prompt += resp.tokenUsage?.prompt || 0;
     tokensUsed.completion += resp.tokenUsage?.completion || 0;
+    tokensUsed.cached += resp.tokenUsage?.cached || 0;
     if (resp.error || !resp.embedding) {
       return fail(resp.error || 'No embedding', tokensUsed);
     }
@@ -594,7 +648,7 @@ export async function matchesAnswerRelevance(
   }
 
   const similarity = similarities.reduce((a, b) => a + b, 0) / similarities.length;
-  const pass = similarity >= threshold;
+  const pass = similarity >= threshold - Number.EPSILON;
   const greaterThanReason = `Relevance ${similarity.toFixed(
     2,
   )} is greater than threshold ${threshold}`;
@@ -649,7 +703,7 @@ export async function matchesContextRecall(
     0,
   );
   const score = numerator / sentences.length;
-  const pass = score >= threshold;
+  const pass = score >= threshold - Number.EPSILON;
   return {
     pass,
     score,
@@ -660,6 +714,7 @@ export async function matchesContextRecall(
       total: resp.tokenUsage?.total || 0,
       prompt: resp.tokenUsage?.prompt || 0,
       completion: resp.tokenUsage?.completion || 0,
+      cached: resp.tokenUsage?.cached || 0,
     },
   };
 }
@@ -696,7 +751,7 @@ export async function matchesContextRelevance(
     0,
   );
   const score = numerator / sentences.length;
-  const pass = score >= threshold;
+  const pass = score >= threshold - Number.EPSILON;
   return {
     pass,
     score,
@@ -707,6 +762,7 @@ export async function matchesContextRelevance(
       total: resp.tokenUsage?.total || 0,
       prompt: resp.tokenUsage?.prompt || 0,
       completion: resp.tokenUsage?.completion || 0,
+      cached: resp.tokenUsage?.cached || 0,
     },
   };
 }
@@ -729,8 +785,14 @@ export async function matchesContextFaithfulness(
   if (grading?.rubricPrompt) {
     invariant(Array.isArray(grading.rubricPrompt), 'rubricPrompt must be an array');
   }
-  const longformPrompt = grading?.rubricPrompt?.[0] || CONTEXT_FAITHFULNESS_LONGFORM;
-  const nliPrompt = grading?.rubricPrompt?.[1] || CONTEXT_FAITHFULNESS_NLI_STATEMENTS;
+  const longformPrompt: string =
+    (typeof grading?.rubricPrompt?.[0] === 'string'
+      ? grading?.rubricPrompt?.[0]
+      : grading?.rubricPrompt?.[0].content) || CONTEXT_FAITHFULNESS_LONGFORM;
+  const nliPrompt: string =
+    (typeof grading?.rubricPrompt?.[1] === 'string'
+      ? grading?.rubricPrompt?.[1]
+      : grading?.rubricPrompt?.[1].content) || CONTEXT_FAITHFULNESS_NLI_STATEMENTS;
 
   let promptText = nunjucks.renderString(longformPrompt, {
     question: JSON.stringify(query).slice(1, -1),
@@ -772,7 +834,7 @@ export async function matchesContextFaithfulness(
     score = (verdicts.split('verdict: no').length - 1) / statements.length;
   }
   score = 1 - score;
-  const pass = score >= threshold;
+  const pass = score >= threshold - Number.EPSILON;
   return {
     pass,
     score,
@@ -783,6 +845,7 @@ export async function matchesContextFaithfulness(
       total: resp.tokenUsage?.total || 0,
       prompt: resp.tokenUsage?.prompt || 0,
       completion: resp.tokenUsage?.completion || 0,
+      cached: resp.tokenUsage?.cached || 0,
     },
   };
 }
@@ -820,9 +883,9 @@ export async function matchesSelectBest(
   invariant(typeof resp.output === 'string', 'select-best produced malformed response');
 
   const firstDigitMatch = resp.output.trim().match(/\d/);
-  const verdict = firstDigitMatch ? parseInt(firstDigitMatch[0], 10) : NaN;
+  const verdict = firstDigitMatch ? Number.parseInt(firstDigitMatch[0], 10) : Number.NaN;
 
-  if (isNaN(verdict) || verdict < 0 || verdict >= outputs.length) {
+  if (Number.isNaN(verdict) || verdict < 0 || verdict >= outputs.length) {
     return new Array(outputs.length).fill(fail(`Invalid select-best verdict: ${verdict}`));
   }
 
@@ -830,6 +893,7 @@ export async function matchesSelectBest(
     total: resp.tokenUsage?.total || 0,
     prompt: resp.tokenUsage?.prompt || 0,
     completion: resp.tokenUsage?.completion || 0,
+    cached: resp.tokenUsage?.cached || 0,
   };
   return outputs.map((output, index) => {
     if (index === verdict) {

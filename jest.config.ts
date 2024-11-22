@@ -2,17 +2,23 @@
 import type { Config } from 'jest';
 
 const config: Config = {
-  collectCoverage: true,
+  collectCoverage: false,
   coverageDirectory: '.coverage',
   coverageProvider: 'v8',
   extensionsToTreatAsEsm: ['.ts'],
-  modulePathIgnorePatterns: ['<rootDir>/examples', '<rootDir>/node_modules', '<rootDir>/dist'],
+  modulePathIgnorePatterns: ['<rootDir>/dist', '<rootDir>/examples', '<rootDir>/node_modules'],
   setupFiles: ['<rootDir>/.jest/setEnvVars.js'],
-  testPathIgnorePatterns: ['<rootDir>/examples', '<rootDir>/node_modules', '<rootDir>/dist'],
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
+  testPathIgnorePatterns: [
+    '.*\\.test\\.tsx$',
+    '.*\\.integration\\.test\\.ts$',
+    '<rootDir>/dist',
+    '<rootDir>/examples',
+    '<rootDir>/node_modules',
+  ],
   transform: {
     '^.+\\.m?[tj]sx?$': '@swc/jest',
   },
-  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
 };
 
 export default config;

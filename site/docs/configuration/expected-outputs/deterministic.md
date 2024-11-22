@@ -13,6 +13,7 @@ These metrics are created by logical tests that are run on LLM output.
 | [contains-any](#contains-any)                                   | output contains any of the listed substrings                       |
 | [contains-json](#contains-json)                                 | output contains valid json (optional json schema validation)       |
 | [contains-sql](#contains-sql)                                   | output contains valid sql                                          |
+| [contains-xml](#contains-xml)                                   | output contains valid xml                                          |
 | [cost](#cost)                                                   | Inference cost is below a threshold                                |
 | [equals](#equality)                                             | output matches exactly                                             |
 | [icontains](#contains)                                          | output contains substring, case insensitive                        |
@@ -22,6 +23,7 @@ These metrics are created by logical tests that are run on LLM output.
 | [is-sql](#is-sql)                                               | output is valid SQL statement (optional authority list validation) |
 | [is-valid-openai-function-call](#is-valid-openai-function-call) | Ensure that the function call matches the function's JSON schema   |
 | [is-valid-openai-tools-call](#is-valid-openai-tools-call)       | Ensure all tool calls match the tools JSON schema                  |
+| [is-xml](#is-xml)                                               | output is valid xml                                                |
 | [javascript](/docs/configuration/expected-outputs/javascript)   | provided Javascript function validates the output                  |
 | [latency](#latency)                                             | Latency is below a threshold (milliseconds)                        |
 | [levenshtein](#levenshtein-distance)                            | Levenshtein distance is below a threshold                          |
@@ -122,7 +124,9 @@ You may optionally set a `value` as a JSON schema in order to validate the JSON 
 assert:
   - type: contains-json
     value:
-      required: [latitude, longitude]
+      required:
+        - latitude
+        - longitude
       type: object
       properties:
         latitude:
@@ -183,7 +187,7 @@ Example:
 
 ```yaml
 providers:
-  - openai:gpt-3.5-turbo
+  - openai:gpt-4o-mini
   - openai:gpt-4
 assert:
   # Pass if the LLM call costs less than $0.001
@@ -236,7 +240,9 @@ You may optionally set a `value` as a JSON schema. If set, the output will be va
 assert:
   - type: is-json
     value:
-      required: [latitude, longitude]
+      required:
+        - latitude
+        - longitude
       type: object
       properties:
         latitude:
@@ -272,6 +278,104 @@ If your JSON schema is large, import it from a file:
 assert:
   - type: is-json
     value: file://./path/to/schema.json
+```
+
+### Is-XML
+
+The `is-xml` assertion checks if the entire LLM output is a valid XML string. It can also verify the presence of specific elements within the XML structure.
+
+Example:
+
+```yaml
+assert:
+  - type: is-xml
+```
+
+This basic usage checks if the output is valid XML.
+
+You can also specify required elements:
+
+```yaml
+assert:
+  - type: is-xml
+    value:
+      requiredElements:
+        - root.child
+        - root.sibling
+```
+
+This checks if the XML is valid and contains the specified elements. The elements are specified as dot-separated paths, allowing for nested element checking.
+
+#### How it works
+
+1. The assertion first attempts to parse the entire output as XML using a parser (fast-xml-parser).
+2. If parsing succeeds, it's considered valid XML.
+3. If `value` is specified:
+   - It checks for a requiredElements key with an array of required elements.
+   - Each element path (e.g., "root.child") is split by dots.
+   - It traverses the parsed XML object following these paths.
+   - If any required element is not found, the assertion fails.
+
+#### Examples
+
+Basic XML validation:
+
+```yaml
+assert:
+  - type: is-xml
+```
+
+Passes for: `<root><child>Content</child></root>`
+Fails for: `<root><child>Content</child></root` (missing closing tag)
+
+Checking for specific elements:
+
+```yaml
+assert:
+  - type: is-xml
+    value:
+      requiredElements:
+        - analysis.classification
+        - analysis.color
+```
+
+Passes for: `<analysis><classification>T-shirt</classification><color>Red</color></analysis>`
+Fails for: `<analysis><classification>T-shirt</classification></analysis>` (missing color element)
+
+Checking nested elements:
+
+```yaml
+assert:
+  - type: is-xml
+    value:
+      requiredElements:
+        - root.parent.child.grandchild
+```
+
+Passes for: `<root><parent><child><grandchild>Content</grandchild></child></parent></root>`
+Fails for: `<root><parent><child></child></parent></root>` (missing grandchild element)
+
+#### Inverse assertion
+
+You can use the `not-is-xml` assertion to check if the output is not valid XML:
+
+```yaml
+assert:
+  - type: not-is-xml
+```
+
+This will pass for non-XML content and fail for valid XML content.
+
+Note: The `is-xml` assertion requires the entire output to be valid XML. For checking XML content within a larger text, use the `contains-xml` assertion.
+
+### Contains-XML
+
+The `contains-xml` is identical to `is-xml`, except it checks if the LLM output contains valid XML content, even if it's not the entire output. For example, the following is valid.
+
+```xml
+Sure, here is your xml:
+<root><child>Content</child></root>
+let me know if you have any other questions!
 ```
 
 ### Is-SQL
@@ -435,7 +539,9 @@ Comparing scores across models may not be meaningful, unless the models have bee
 This makes it easier to include in an aggregate promptfoo score, as higher scores are usually better. In this example, we compare perplexity across multiple GPTs:
 
 ```yaml
-providers: [gpt-4-1106-preview, gpt-3.5-turbo-1106]
+providers:
+  - openai:gpt-4o-mini
+  - openai:gpt-4o
 tests:
   - assert:
       - type: perplexity-score
@@ -506,4 +612,66 @@ You may also return a score:
   "score": 0.5,
   "reason": "The output meets the custom validation criteria"
 }
+```
+
+### Rouge-N
+
+The `rouge-n` assertion checks if the Rouge-N score between the LLM output and expected value is above a given threshold.
+
+Rouge-N is a recall-oriented metric that measures the overlap of n-grams between the LLM output and the expected text. The score ranges from 0 (no overlap) to 1 (perfect match).
+
+Example:
+
+```yaml
+assert:
+  # Ensure Rouge-N score compared to "hello world" is >= 0.75 (default threshold)
+  - type: rouge-n
+    value: hello world
+
+  # With custom threshold
+  - type: rouge-n
+    threshold: 0.6
+    value: hello world
+```
+
+`value` can reference other variables using template syntax. For example:
+
+```yaml
+tests:
+  - vars:
+      expected: hello world
+    assert:
+      - type: rouge-n
+        value: '{{expected}}'
+```
+
+### BLEU
+
+BLEU (Bilingual Evaluation Understudy) is a precision-oriented metric that measures the quality of text by comparing it to one or more reference texts. The score ranges from 0 (no match) to 1 (perfect match). It considers exact matches of words and phrases (n-grams) between the output and reference text.
+
+While Rouge-N focuses on recall (how much of the reference text is captured), BLEU focuses on precision (how accurate the generated text is).
+
+Example:
+
+```yaml
+assert:
+  # Ensure BLEU score compared to "hello world" is >= 0.5 (default threshold)
+  - type: bleu
+    value: hello world
+
+  # With custom threshold
+  - type: bleu
+    threshold: 0.7
+    value: hello world
+```
+
+`value` can reference other variables using template syntax. For example:
+
+```yaml
+tests:
+  - vars:
+      expected: hello world
+    assert:
+      - type: bleu
+        value: '{{expected}}'
 ```

@@ -1,11 +1,9 @@
 import chalk from 'chalk';
 import semverGt from 'semver/functions/gt';
-import packageJson from '../package.json';
-import { TERMINAL_MAX_WIDTH } from './constants';
+import { TERMINAL_MAX_WIDTH, VERSION } from './constants';
+import { getEnvBool } from './envars';
 import { fetchWithTimeout } from './fetch';
 import logger from './logger';
-
-const VERSION = packageJson.version;
 
 export async function getLatestVersion() {
   const response = await fetchWithTimeout(`https://api.promptfoo.dev/api/latestVersion`, {}, 1000);
@@ -17,7 +15,7 @@ export async function getLatestVersion() {
 }
 
 export async function checkForUpdates(): Promise<boolean> {
-  if (process.env.PROMPTFOO_DISABLE_UPDATE) {
+  if (getEnvBool('PROMPTFOO_DISABLE_UPDATE')) {
     return false;
   }
 

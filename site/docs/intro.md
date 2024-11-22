@@ -4,17 +4,27 @@ sidebar_position: 1
 
 # Intro
 
-`promptfoo` is a CLI and library for evaluating LLM apps.
+`promptfoo` is an [open-source](https://github.com/promptfoo/promptfoo) CLI and library for evaluating and red-teaming LLM apps.
 
 With promptfoo, you can:
 
 - **Build reliable prompts, models, and RAGs** with benchmarks specific to your use-case
+- **Secure your apps** with automated [red teaming](/docs/red-team) and pentesting
 - **Speed up evaluations** with caching, concurrency, and live reloading
-- **Score outputs automatically** by defining [metrics](/docs/configuration/expected-outputs) and perform automated [red teaming](/docs/red-team)
+- **Score outputs automatically** by defining [metrics](/docs/configuration/expected-outputs)
 - Use as a [CLI](/docs/usage/command-line), [library](/docs/usage/node-package), or in [CI/CD](/docs/integrations/github-action)
 - Use OpenAI, Anthropic, Azure, Google, HuggingFace, open-source models like Llama, or integrate custom API providers for [any LLM API](/docs/providers)
 
 The goal: **test-driven LLM development**, not trial-and-error.
+
+<div style={{ border: '1px solid #90EE90', borderRadius: '4px', padding: '1rem', backgroundColor: '#F0FFF0', marginBottom: '1rem', color: '#000000' }}>
+
+**Get Started:**
+
+- [**Red teaming**](/docs/red-team/quickstart) - LLM security scans
+- [**Evaluations**](/docs/getting-started) - LLM quality benchmarks
+
+</div>
 
 promptfoo produces matrix views that let you quickly evaluate outputs across many prompts.
 

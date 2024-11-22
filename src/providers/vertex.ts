@@ -1,5 +1,7 @@
 import Clone from 'rfdc';
 import { getCache, isCacheEnabled } from '../cache';
+import cliState from '../cliState';
+import { getEnvString } from '../envars';
 import logger from '../logger';
 import type {
   ApiEmbeddingProvider,
@@ -9,12 +11,11 @@ import type {
   ProviderResponse,
   ProviderEmbeddingResponse,
   TokenUsage,
-} from '../types.js';
-import { getNunjucksEngine } from '../util';
-import { parseChatPrompt } from './shared';
+} from '../types';
+import { getNunjucksEngine } from '../util/templates';
+import { parseChatPrompt, REQUEST_TIMEOUT_MS } from './shared';
+import type { GeminiErrorResponse, GeminiFormat, Palm2ApiResponse } from './vertexUtil';
 import {
-  GeminiErrorResponse,
-  Palm2ApiResponse,
   getGoogleClient,
   maybeCoerceToGeminiFormat,
   type GeminiApiResponse,
@@ -122,7 +123,7 @@ class VertexGenericProvider implements ApiProvider {
     return (
       this.config.apiHost ||
       this.env?.VERTEX_API_HOST ||
-      process.env.VERTEX_API_HOST ||
+      getEnvString('VERTEX_API_HOST') ||
       `${this.getRegion()}-aiplatform.googleapis.com`
     );
   }
@@ -132,17 +133,20 @@ class VertexGenericProvider implements ApiProvider {
       (await getGoogleClient()).projectId ||
       this.config.projectId ||
       this.env?.VERTEX_PROJECT_ID ||
-      process.env.VERTEX_PROJECT_ID
+      getEnvString('VERTEX_PROJECT_ID')
     );
   }
 
   getApiKey(): string | undefined {
-    return this.config.apiKey || this.env?.VERTEX_API_KEY || process.env.VERTEX_API_KEY;
+    return this.config.apiKey || this.env?.VERTEX_API_KEY || getEnvString('VERTEX_API_KEY');
   }
 
   getRegion(): string {
     return (
-      this.config.region || this.env?.VERTEX_REGION || process.env.VERTEX_REGION || 'us-central1'
+      this.config.region ||
+      this.env?.VERTEX_REGION ||
+      getEnvString('VERTEX_REGION') ||
+      'us-central1'
     );
   }
 
@@ -150,7 +154,7 @@ class VertexGenericProvider implements ApiProvider {
     return (
       this.config.publisher ||
       this.env?.VERTEX_PUBLISHER ||
-      process.env.VERTEX_PUBLISHER ||
+      getEnvString('VERTEX_PUBLISHER') ||
       'google'
     );
   }
@@ -164,39 +168,6 @@ class VertexGenericProvider implements ApiProvider {
 export class VertexChatProvider extends VertexGenericProvider {
   // TODO(ian): Completion models
   // https://cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versioning#gemini-model-versions
-  static CHAT_MODELS = [
-    'aqa',
-    'chat-bison',
-    'chat-bison-32k',
-    'chat-bison-32k@001',
-    'chat-bison-32k@002',
-    'chat-bison@001',
-    'chat-bison@002',
-    'codechat-bison',
-    'codechat-bison-32k',
-    'codechat-bison-32k@001',
-    'codechat-bison-32k@002',
-    'codechat-bison@001',
-    'codechat-bison@002',
-    'gemini-1.0-pro',
-    'gemini-1.0-pro-001',
-    'gemini-1.0-pro-002',
-    'gemini-1.0-pro-vision',
-    'gemini-1.0-pro-vision-001',
-    'gemini-1.0-pro-vision-001',
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-001',
-    'gemini-1.5-flash-preview-0514',
-    'gemini-1.5-pro',
-    'gemini-1.5-pro-001',
-    'gemini-1.5-pro-latest',
-    'gemini-1.5-pro-preview-0409',
-    'gemini-1.5-pro-preview-0514',
-    'gemini-pro',
-    'gemini-pro-vision',
-    'gemini-ultra',
-  ];
-
   constructor(
     modelName: string,
     options: { config?: VertexCompletionOptions; id?: string; env?: EnvOverrides } = {},
@@ -213,20 +184,27 @@ export class VertexChatProvider extends VertexGenericProvider {
 
   async callGeminiApi(prompt: string, context?: CallApiContextParams): Promise<ProviderResponse> {
     // https://cloud.google.com/vertex-ai/docs/generative-ai/model-reference/gemini#gemini-pro
-    let contents = parseChatPrompt(prompt, {
-      role: 'user',
-      parts: {
-        text: prompt,
+    let contents: GeminiFormat | { role: string; parts: { text: string } } = parseChatPrompt(
+      prompt,
+      {
+        role: 'user',
+        parts: {
+          text: prompt,
+        },
       },
-    });
-    const { contents: updatedContents, coerced } = maybeCoerceToGeminiFormat(contents);
+    );
+    const {
+      contents: updatedContents,
+      coerced,
+      systemInstruction: parsedSystemInstruction,
+    } = maybeCoerceToGeminiFormat(contents);
     if (coerced) {
       logger.debug(`Coerced JSON prompt to Gemini format: ${JSON.stringify(contents)}`);
       contents = updatedContents;
     }
 
-    let systemInstruction: Content | undefined;
-    if (this.config.systemInstruction) {
+    let systemInstruction: Content | undefined = parsedSystemInstruction;
+    if (this.config.systemInstruction && !systemInstruction) {
       // Make a copy
       systemInstruction = clone(this.config.systemInstruction);
       if (systemInstruction && context?.vars) {
@@ -238,10 +216,9 @@ export class VertexChatProvider extends VertexGenericProvider {
         }
       }
     }
-
     // https://ai.google.dev/api/rest/v1/models/streamGenerateContent
     const body = {
-      contents,
+      contents: contents as GeminiFormat,
       generationConfig: {
         context: this.config.context,
         examples: this.config.examples,
@@ -265,12 +242,12 @@ export class VertexChatProvider extends VertexGenericProvider {
     if (isCacheEnabled()) {
       cachedResponse = await cache.get(cacheKey);
       if (cachedResponse) {
-        logger.debug(`Returning cached response for prompt: ${prompt}`);
         const parsedCachedResponse = JSON.parse(cachedResponse as string);
         const tokenUsage = parsedCachedResponse.tokenUsage as TokenUsage;
         if (tokenUsage) {
           tokenUsage.cached = tokenUsage.total;
         }
+        logger.debug(`Returning cached response: ${cachedResponse}`);
         return { ...parsedCachedResponse, cached: true };
       }
     }
@@ -285,6 +262,7 @@ export class VertexChatProvider extends VertexGenericProvider {
         url,
         method: 'POST',
         data: body,
+        timeout: REQUEST_TIMEOUT_MS,
       });
       data = res.data as GeminiApiResponse;
       logger.debug(`Gemini API response: ${JSON.stringify(data)}`);
@@ -315,22 +293,53 @@ export class VertexChatProvider extends VertexGenericProvider {
     logger.debug(`Gemini API response: ${JSON.stringify(data)}`);
     try {
       const dataWithError = data as GeminiErrorResponse[];
-      const error = dataWithError[0].error;
+      const error = dataWithError[0]?.error;
       if (error) {
         return {
           error: `Error ${error.code}: ${error.message}`,
         };
       }
       const dataWithResponse = data as GeminiResponseData[];
-      const output = dataWithResponse
-        .map((datum: GeminiResponseData) => {
+      let output = '';
+      for (const datum of dataWithResponse) {
+        if (datum.candidates && datum.candidates[0]?.content?.parts) {
           const part = datum.candidates[0].content.parts[0];
           if ('text' in part) {
-            return part.text;
+            output += part.text;
+          } else {
+            output += JSON.stringify(part);
           }
-          return JSON.stringify(part);
-        })
-        .join('');
+        } else if (datum.candidates && datum.candidates[0]?.finishReason === 'SAFETY') {
+          if (cliState.config?.redteam) {
+            // Refusals are not errors during redteams, they're actually successes.
+            return {
+              output: 'Content was blocked due to safety settings.',
+            };
+          }
+          return {
+            error: 'Content was blocked due to safety settings.',
+          };
+        }
+      }
+
+      if ('promptFeedback' in data[0] && data[0].promptFeedback?.blockReason) {
+        if (cliState.config?.redteam) {
+          // Refusals are not errors during redteams, they're actually successes.
+          return {
+            output: `Content was blocked due to safety settings: ${data[0].promptFeedback.blockReason}`,
+          };
+        }
+        return {
+          error: `Content was blocked due to safety settings: ${data[0].promptFeedback.blockReason}`,
+        };
+      }
+
+      if (!output) {
+        return {
+          error: `No output found in response: ${JSON.stringify(data)}`,
+        };
+      }
+
       const lastData = dataWithResponse[dataWithResponse.length - 1];
       const tokenUsage = {
         total: lastData.usageMetadata?.totalTokenCount || 0,
@@ -350,7 +359,7 @@ export class VertexChatProvider extends VertexGenericProvider {
       return response;
     } catch (err) {
       return {
-        error: `Gemini API response error: ${String(err)}: ${JSON.stringify(data)}`,
+        error: `Gemini API response error: ${String(err)}. Response data: ${JSON.stringify(data)}`,
       };
     }
   }
@@ -389,12 +398,12 @@ export class VertexChatProvider extends VertexGenericProvider {
     if (isCacheEnabled()) {
       cachedResponse = await cache.get(cacheKey);
       if (cachedResponse) {
-        logger.debug(`Returning cached response for prompt: ${prompt}`);
         const parsedCachedResponse = JSON.parse(cachedResponse as string);
         const tokenUsage = parsedCachedResponse.tokenUsage as TokenUsage;
         if (tokenUsage) {
           tokenUsage.cached = tokenUsage.total;
         }
+        logger.debug(`Returning cached response: ${cachedResponse}`);
         return { ...parsedCachedResponse, cached: true };
       }
     }
@@ -412,6 +421,7 @@ export class VertexChatProvider extends VertexGenericProvider {
           'Content-Type': 'application/json',
         },
         data: body,
+        timeout: REQUEST_TIMEOUT_MS,
       });
       data = res.data;
     } catch (err) {

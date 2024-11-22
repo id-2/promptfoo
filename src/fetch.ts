@@ -1,13 +1,56 @@
-import fetch from 'node-fetch';
-import type { RequestInfo, RequestInit, Response } from 'node-fetch';
 import { ProxyAgent } from 'proxy-agent';
+import invariant from 'tiny-invariant';
+import { VERSION } from './constants';
+import { getEnvInt, getEnvBool } from './envars';
+import logger from './logger';
+import { sleep } from './util/time';
 
 export async function fetchWithProxy(
   url: RequestInfo,
   options: RequestInit = {},
 ): Promise<Response> {
-  options.agent = new ProxyAgent();
-  return fetch(url, options);
+  let finalUrl = url;
+
+  const finalOptions = {
+    ...options,
+    headers: {
+      ...options.headers,
+      'x-promptfoo-version': VERSION,
+    } as Record<string, string>,
+  };
+
+  if (typeof url === 'string') {
+    try {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.username || parsedUrl.password) {
+        if (finalOptions.headers && 'Authorization' in finalOptions.headers) {
+          logger.warn(
+            'Both URL credentials and Authorization header present - URL credentials will be ignored',
+          );
+        } else {
+          // Move credentials to Authorization header
+          const username = parsedUrl.username || '';
+          const password = parsedUrl.password || '';
+          const credentials = Buffer.from(`${username}:${password}`).toString('base64');
+          finalOptions.headers = {
+            ...finalOptions.headers,
+            Authorization: `Basic ${credentials}`,
+          };
+        }
+        parsedUrl.username = '';
+        parsedUrl.password = '';
+        finalUrl = parsedUrl.toString();
+      }
+    } catch (e) {
+      logger.debug(`URL parsing failed in fetchWithProxy: ${e}`);
+    }
+  }
+
+  const agent = new ProxyAgent({
+    rejectUnauthorized: false,
+  });
+
+  return fetch(finalUrl, { ...finalOptions, agent } as RequestInit);
 }
 
 export function fetchWithTimeout(
@@ -25,7 +68,7 @@ export function fetchWithTimeout(
 
     fetchWithProxy(url, {
       ...options,
-      signal: signal as never, // AbortSignal type is not exported by node-fetch 2.x
+      signal,
     })
       .then((response) => {
         clearTimeout(timeoutId);
@@ -38,6 +81,45 @@ export function fetchWithTimeout(
   });
 }
 
+export function isRateLimited(response: Response): boolean {
+  // These checks helps make sure we set up tests correctly.
+  invariant(response.headers, 'Response headers are missing');
+  invariant(response.status, 'Response status is missing');
+
+  // Check for OpenAI specific rate limit headers and status codes
+  return (
+    response.headers.get('X-RateLimit-Remaining') === '0' ||
+    response.status === 429 ||
+    // OpenAI specific error codes
+    response.headers.get('x-ratelimit-remaining-requests') === '0' ||
+    response.headers.get('x-ratelimit-remaining-tokens') === '0'
+  );
+}
+
+export async function handleRateLimit(response: Response): Promise<void> {
+  const rateLimitReset = response.headers.get('X-RateLimit-Reset');
+  const retryAfter = response.headers.get('Retry-After');
+  // OpenAI specific headers
+  const openaiReset =
+    response.headers.get('x-ratelimit-reset-requests') ||
+    response.headers.get('x-ratelimit-reset-tokens');
+
+  let waitTime = 60_000; // Default wait time of 60 seconds
+
+  if (openaiReset) {
+    waitTime = Math.max(Number.parseInt(openaiReset) * 1000, 0);
+  } else if (rateLimitReset) {
+    const resetTime = new Date(Number.parseInt(rateLimitReset) * 1000);
+    const now = new Date();
+    waitTime = Math.max(resetTime.getTime() - now.getTime() + 1000, 0);
+  } else if (retryAfter) {
+    waitTime = Number.parseInt(retryAfter) * 1000;
+  }
+
+  logger.debug(`Rate limited, waiting ${waitTime}ms before retry`);
+  await sleep(waitTime);
+}
+
 export async function fetchWithRetries(
   url: RequestInfo,
   options: RequestInit = {},
@@ -45,20 +127,30 @@ export async function fetchWithRetries(
   retries: number = 4,
 ): Promise<Response> {
   let lastError;
-  const backoff = process.env.PROMPTFOO_REQUEST_BACKOFF_MS
-    ? parseInt(process.env.PROMPTFOO_REQUEST_BACKOFF_MS, 10)
-    : 5000;
+  const backoff = getEnvInt('PROMPTFOO_REQUEST_BACKOFF_MS', 5000);
+
   for (let i = 0; i < retries; i++) {
+    let response;
     try {
-      const response = await fetchWithTimeout(url, options, timeout);
-      if (process.env.PROMPTFOO_RETRY_5XX && response.status / 100 === 5) {
+      response = await fetchWithTimeout(url, options, timeout);
+
+      if (getEnvBool('PROMPTFOO_RETRY_5XX') && response.status >= 500 && response.status < 600) {
         throw new Error(`Internal Server Error: ${response.status} ${response.statusText}`);
       }
+
+      if (response && isRateLimited(response)) {
+        logger.debug(
+          `Rate limited on URL ${url}: ${response.status} ${response.statusText}, waiting before retry ${i + 1}/${retries}`,
+        );
+        await handleRateLimit(response);
+        continue;
+      }
+
       return response;
     } catch (error) {
       lastError = error;
       const waitTime = Math.pow(2, i) * (backoff + 1000 * Math.random());
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
+      await sleep(waitTime);
     }
   }
   throw new Error(`Request failed after ${retries} retries: ${(lastError as Error).message}`);

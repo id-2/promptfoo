@@ -1,7 +1,7 @@
 import type { Cache } from 'cache-manager';
-import fetch from 'node-fetch';
 import Replicate from 'replicate';
 import { getCache, isCacheEnabled } from '../cache';
+import { getEnvString, getEnvFloat, getEnvInt } from '../envars';
 import logger from '../logger';
 import type {
   ApiModerationProvider,
@@ -13,7 +13,8 @@ import type {
   ProviderModerationResponse,
   ProviderResponse,
 } from '../types';
-import { safeJsonStringify } from '../util';
+import { safeJsonStringify } from '../util/json';
+import { parseChatPrompt } from './shared';
 
 interface ReplicateCompletionOptions {
   apiKey?: string;
@@ -53,8 +54,8 @@ export class ReplicateProvider implements ApiProvider {
       config?.apiKey ||
       env?.REPLICATE_API_KEY ||
       env?.REPLICATE_API_TOKEN ||
-      process.env.REPLICATE_API_TOKEN ||
-      process.env.REPLICATE_API_KEY;
+      getEnvString('REPLICATE_API_TOKEN') ||
+      getEnvString('REPLICATE_API_KEY');
     this.config = config || {};
     this.id = id ? () => id : this.id;
   }
@@ -101,43 +102,33 @@ export class ReplicateProvider implements ApiProvider {
       fetch: fetch as any,
     });
 
+    const messages = parseChatPrompt(prompt, [{ role: 'user', content: prompt }]);
+    const systemPrompt =
+      messages.find((message) => message.role === 'system')?.content ||
+      this.config.system_prompt ||
+      getEnvString('REPLICATE_SYSTEM_PROMPT');
+    const userPrompt = messages.find((message) => message.role === 'user')?.content || prompt;
+
     logger.debug(`Calling Replicate: ${prompt}`);
     let response;
     try {
-      const getValue = (
-        configValue: number | string | undefined,
-        envVar: string,
-        parseFunc = (val: any) => val,
-      ) => {
-        const envValue = process.env[envVar];
-        if (configValue !== undefined) {
-          return configValue;
-        } else if (envValue !== undefined) {
-          return parseFunc(envValue);
-        }
-        return undefined;
-      };
-
       const inputOptions = {
-        max_length: getValue(this.config.max_length, 'REPLICATE_MAX_LENGTH', parseInt),
-        max_new_tokens: getValue(this.config.max_new_tokens, 'REPLICATE_MAX_NEW_TOKENS', parseInt),
-        temperature: getValue(this.config.temperature, 'REPLICATE_TEMPERATURE', parseFloat),
-        top_p: getValue(this.config.top_p, 'REPLICATE_TOP_P', parseFloat),
-        top_k: getValue(this.config.top_k, 'REPLICATE_TOP_K', parseInt),
-        repetition_penalty: getValue(
-          this.config.repetition_penalty,
-          'REPLICATE_REPETITION_PENALTY',
-          parseFloat,
-        ),
-        system_prompt: getValue(this.config.system_prompt, 'REPLICATE_SYSTEM_PROMPT'),
-        stop_sequences: getValue(this.config.stop_sequences, 'REPLICATE_STOP_SEQUENCES'),
-        seed: getValue(this.config.seed, 'REPLICATE_SEED', parseInt),
+        max_length: this.config.max_length || getEnvInt('REPLICATE_MAX_LENGTH'),
+        max_new_tokens: this.config.max_new_tokens || getEnvInt('REPLICATE_MAX_NEW_TOKENS'),
+        temperature: this.config.temperature || getEnvFloat('REPLICATE_TEMPERATURE'),
+        top_p: this.config.top_p || getEnvFloat('REPLICATE_TOP_P'),
+        top_k: this.config.top_k || getEnvInt('REPLICATE_TOP_K'),
+        repetition_penalty:
+          this.config.repetition_penalty || getEnvFloat('REPLICATE_REPETITION_PENALTY'),
+        stop_sequences: this.config.stop_sequences || getEnvString('REPLICATE_STOP_SEQUENCES'),
+        seed: this.config.seed || getEnvInt('REPLICATE_SEED'),
+        system_prompt: systemPrompt,
+        prompt: userPrompt,
       };
 
       const data = {
         input: {
           ...this.config,
-          prompt,
           ...Object.fromEntries(Object.entries(inputOptions).filter(([_, v]) => v !== undefined)),
         },
       };
@@ -324,7 +315,6 @@ export class ReplicateImageProvider extends ReplicateProvider {
     if (isCacheEnabled()) {
       const cachedResponse = await cache.get(cacheKey);
       if (cachedResponse) {
-        console.log(cachedResponse);
         logger.debug(`Retrieved cached response for ${prompt}: ${cachedResponse}`);
         response = JSON.parse(cachedResponse as string);
         cached = true;

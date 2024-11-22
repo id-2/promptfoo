@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
 prompts:
   - 'You are an angry pirate. Be concise and stay in character. Tell me about {{topic}}'
   - id: 'You are an angry pirate. Be concise and stay in character. Tell me about {{topic}}'
@@ -21,6 +22,9 @@ prompts:
   - subfolder/prompt.json
 
   - file://./subfolder/*.json
+
+  - id: file://prompt.md
+    label: markdown prompt
 
   - id: file://prompt.jsonl
     label: prompt_jsonl
@@ -50,8 +54,12 @@ prompts:
     label: prompt_python with prompt1
   - file://prompt_python.py:prompt1
 
+  - id: file://prompt_python.py:Prompt.prompt
+    label: prompt_python_class
+  - file://prompt_python.py:Prompt.prompt_with_cot
+
 providers:
-  - openai:gpt-3.5-turbo
+  - echo
 
 tests:
   - vars:

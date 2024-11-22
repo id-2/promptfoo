@@ -1,8 +1,10 @@
 import Anthropic, { APIError } from '@anthropic-ai/sdk';
 import { getCache, isCacheEnabled } from '../cache';
+import { getEnvString, getEnvFloat, getEnvInt } from '../envars';
 import logger from '../logger';
-import type { ApiProvider, EnvOverrides, ProviderResponse, TokenUsage } from '../types.js';
-import { parseChatPrompt } from './shared';
+import type { ApiProvider, EnvOverrides, ProviderResponse, TokenUsage } from '../types';
+import { maybeLoadFromExternalFile } from '../util';
+import { calculateCost } from './shared';
 
 const ANTHROPIC_MODELS = [
   ...['claude-instant-1.2'].map((model) => ({
@@ -47,7 +49,14 @@ const ANTHROPIC_MODELS = [
       output: 0.075 / 1000,
     },
   })),
-  ...['claude-3-5-sonnet-20240620'].map((model) => ({
+  ...['claude-3-5-haiku-20241022'].map((model) => ({
+    id: model,
+    cost: {
+      input: 1 / 1e6,
+      output: 5 / 1e6,
+    },
+  })),
+  ...['claude-3-5-sonnet-20240620', 'claude-3-5-sonnet-20241022'].map((model) => ({
     id: model,
     cost: {
       input: 3 / 1e6,
@@ -70,6 +79,7 @@ interface AnthropicMessageOptions {
     | Anthropic.MessageCreateParams.ToolChoiceAny
     | Anthropic.MessageCreateParams.ToolChoiceAuto
     | Anthropic.MessageCreateParams.ToolChoiceTool;
+  headers?: Record<string, string>;
 }
 
 function getTokenUsage(data: any, cached: boolean): Partial<TokenUsage> {
@@ -107,55 +117,87 @@ export function outputFromMessage(message: Anthropic.Messages.Message) {
     .join('\n\n');
 }
 
-interface AnthropicMessageInput {
-  role: 'user' | 'assistant' | 'system';
-  content: string | Array<Anthropic.ImageBlockParam | Anthropic.TextBlockParam>;
-}
+export function parseMessages(messages: string): {
+  system?: Anthropic.TextBlockParam[];
+  extractedMessages: Anthropic.MessageParam[];
+} {
+  try {
+    const parsed = JSON.parse(messages);
+    if (Array.isArray(parsed)) {
+      const systemMessage = parsed.find((msg) => msg.role === 'system');
+      return {
+        extractedMessages: parsed
+          .filter((msg) => msg.role !== 'system')
+          .map((msg) => ({
+            role: msg.role,
+            content: Array.isArray(msg.content)
+              ? msg.content
+              : [{ type: 'text', text: msg.content }],
+          })),
+        system: systemMessage
+          ? Array.isArray(systemMessage.content)
+            ? systemMessage.content
+            : [{ type: 'text', text: systemMessage.content }]
+          : undefined,
+      };
+    }
+  } catch {
+    // Not JSON, parse as plain text
+  }
+  const lines = messages
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line);
+  let system: Anthropic.TextBlockParam[] | undefined;
+  const extractedMessages: Anthropic.MessageParam[] = [];
+  let currentRole: 'user' | 'assistant' | null = null;
+  let currentContent: string[] = [];
 
-export function parseMessages(messages: string) {
-  // We need to be able to handle the 'system' role prompts that
-  // are in the style of OpenAI's chat prompts.
-  // As a result, AnthropicMessageInput is the same as Anthropic.MessageParam
-  // just with the system role added on
-  const chats = parseChatPrompt<AnthropicMessageInput[]>(messages, [
-    { role: 'user' as const, content: messages },
-  ]);
-  // Convert from OpenAI to Anthropic format
-  const systemMessage = chats.find((m) => m.role === 'system')?.content;
-  const system = typeof systemMessage === 'string' ? systemMessage : undefined;
-  const extractedMessages: Anthropic.MessageParam[] = chats
-    .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .map((m) => {
-      const role = m.role as 'user' | 'assistant';
-      if (typeof m.content === 'string') {
-        const content = [{ type: 'text' as const, text: m.content }];
-        return { role, content };
-      } else {
-        const content = [...m.content];
-        return { role, content };
-      }
+  const pushMessage = () => {
+    if (currentRole && currentContent.length > 0) {
+      extractedMessages.push({
+        role: currentRole,
+        content: [{ type: 'text', text: currentContent.join('\n') }],
+      });
+      currentContent = [];
+    }
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('system:')) {
+      system = [{ type: 'text', text: line.slice(7).trim() }];
+    } else if (line.startsWith('user:') || line.startsWith('assistant:')) {
+      pushMessage();
+      currentRole = line.startsWith('user:') ? 'user' : 'assistant';
+      currentContent.push(line.slice(line.indexOf(':') + 1).trim());
+    } else if (currentRole) {
+      currentContent.push(line);
+    } else {
+      // If no role is set, assume it's a user message
+      currentRole = 'user';
+      currentContent.push(line);
+    }
+  }
+
+  pushMessage();
+
+  if (extractedMessages.length === 0 && !system) {
+    extractedMessages.push({
+      role: 'user',
+      content: [{ type: 'text', text: messages.trim() }],
     });
+  }
+
   return { system, extractedMessages };
 }
 
-export function calculateCost(
+export function calculateAnthropicCost(
   modelName: string,
   config: AnthropicMessageOptions,
   promptTokens?: number,
   completionTokens?: number,
 ): number | undefined {
-  if (!promptTokens || !completionTokens) {
-    return undefined;
-  }
-
-  const model = ANTHROPIC_MODELS.find((m) => m.id === modelName);
-  if (!model || !model.cost) {
-    return undefined;
-  }
-
-  const inputCost = config.cost ?? model.cost.input;
-  const outputCost = config.cost ?? model.cost.output;
-  return inputCost * promptTokens + outputCost * completionTokens || undefined;
+  return calculateCost(modelName, config, promptTokens, completionTokens, ANTHROPIC_MODELS);
 }
 
 export class AnthropicMessagesProvider implements ApiProvider {
@@ -181,7 +223,7 @@ export class AnthropicMessagesProvider implements ApiProvider {
     this.modelName = modelName;
     this.id = id ? () => id : this.id;
     this.config = config || {};
-    this.apiKey = config?.apiKey || env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+    this.apiKey = config?.apiKey || env?.ANTHROPIC_API_KEY || getEnvString('ANTHROPIC_API_KEY');
     this.anthropic = new Anthropic({ apiKey: this.apiKey, baseURL: this.config.apiBaseUrl });
   }
 
@@ -191,6 +233,14 @@ export class AnthropicMessagesProvider implements ApiProvider {
 
   toString(): string {
     return `[Anthropic Messages Provider ${this.modelName || 'claude-2.1'}]`;
+  }
+
+  getApiKey(): string | undefined {
+    return this.apiKey;
+  }
+
+  getApiBaseUrl(): string | undefined {
+    return this.config.apiBaseUrl;
   }
 
   async callApi(prompt: string): Promise<ProviderResponse> {
@@ -204,12 +254,11 @@ export class AnthropicMessagesProvider implements ApiProvider {
     const params: Anthropic.MessageCreateParams = {
       model: this.modelName,
       ...(system ? { system } : {}),
-      max_tokens:
-        this.config?.max_tokens || parseInt(process.env.ANTHROPIC_MAX_TOKENS || '1024', 10),
+      max_tokens: this.config?.max_tokens || getEnvInt('ANTHROPIC_MAX_TOKENS', 1024),
       messages: extractedMessages,
       stream: false,
-      temperature: this.config.temperature || parseFloat(process.env.ANTHROPIC_TEMPERATURE || '0'),
-      ...(this.config.tools ? { tools: this.config.tools } : {}),
+      temperature: this.config.temperature || getEnvFloat('ANTHROPIC_TEMPERATURE', 0),
+      ...(this.config.tools ? { tools: maybeLoadFromExternalFile(this.config.tools) } : {}),
       ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
     };
 
@@ -229,7 +278,7 @@ export class AnthropicMessagesProvider implements ApiProvider {
             output: outputFromMessage(parsedCachedResponse),
             tokenUsage: {},
           };
-        } catch (err) {
+        } catch {
           // Could be an old cache item, which was just the text content from TextBlock.
           return {
             output: cachedResponse,
@@ -240,7 +289,9 @@ export class AnthropicMessagesProvider implements ApiProvider {
     }
 
     try {
-      const response = await this.anthropic.messages.create(params);
+      const response = await this.anthropic.messages.create(params, {
+        ...(this.config.headers ? { headers: this.config.headers } : {}),
+      });
 
       logger.debug(`Anthropic Messages API response: ${JSON.stringify(response)}`);
 
@@ -255,7 +306,7 @@ export class AnthropicMessagesProvider implements ApiProvider {
       return {
         output: outputFromMessage(response),
         tokenUsage: getTokenUsage(response, false),
-        cost: calculateCost(
+        cost: calculateAnthropicCost(
           this.modelName,
           this.config,
           response.usage?.input_tokens,
@@ -307,7 +358,7 @@ export class AnthropicCompletionProvider implements ApiProvider {
   ) {
     const { config, id, env } = options;
     this.modelName = modelName;
-    this.apiKey = config?.apiKey || env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+    this.apiKey = config?.apiKey || env?.ANTHROPIC_API_KEY || getEnvString('ANTHROPIC_API_KEY');
     this.anthropic = new Anthropic({ apiKey: this.apiKey });
     this.config = config || {};
     this.id = id ? () => id : this.id;
@@ -330,8 +381,8 @@ export class AnthropicCompletionProvider implements ApiProvider {
 
     let stop: string[];
     try {
-      stop = process.env.ANTHROPIC_STOP
-        ? JSON.parse(process.env.ANTHROPIC_STOP)
+      stop = getEnvString('ANTHROPIC_STOP')
+        ? JSON.parse(getEnvString('ANTHROPIC_STOP') || '')
         : ['<|im_end|>', '<|endoftext|>'];
     } catch (err) {
       throw new Error(`ANTHROPIC_STOP is not a valid JSON string: ${err}`);
@@ -341,8 +392,8 @@ export class AnthropicCompletionProvider implements ApiProvider {
       model: this.modelName,
       prompt: `${Anthropic.HUMAN_PROMPT} ${prompt} ${Anthropic.AI_PROMPT}`,
       max_tokens_to_sample:
-        this.config?.max_tokens_to_sample || parseInt(process.env.ANTHROPIC_MAX_TOKENS || '1024'),
-      temperature: this.config.temperature ?? parseFloat(process.env.ANTHROPIC_TEMPERATURE || '0'),
+        this.config?.max_tokens_to_sample || getEnvInt('ANTHROPIC_MAX_TOKENS', 1024),
+      temperature: this.config.temperature ?? getEnvFloat('ANTHROPIC_TEMPERATURE', 0),
       stop_sequences: stop,
     };
 
@@ -392,9 +443,13 @@ export class AnthropicCompletionProvider implements ApiProvider {
   }
 }
 
-export const DefaultGradingProvider = new AnthropicMessagesProvider('claude-3-opus-20240229');
-export const DefaultGradingJsonProvider = new AnthropicMessagesProvider('claude-3-opus-20240229');
-export const DefaultSuggestionsProvider = new AnthropicMessagesProvider('claude-3-opus-20240229');
+export const DefaultGradingProvider = new AnthropicMessagesProvider('claude-3-5-sonnet-20240620');
+export const DefaultGradingJsonProvider = new AnthropicMessagesProvider(
+  'claude-3-5-sonnet-20240620',
+);
+export const DefaultSuggestionsProvider = new AnthropicMessagesProvider(
+  'claude-3-5-sonnet-20240620',
+);
 
 export class AnthropicLlmRubricProvider extends AnthropicMessagesProvider {
   constructor(modelName: string) {

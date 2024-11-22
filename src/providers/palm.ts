@@ -1,7 +1,11 @@
 import { fetchWithCache } from '../cache';
+import { getEnvString } from '../envars';
 import logger from '../logger';
-import type { ApiProvider, EnvOverrides, ProviderResponse } from '../types.js';
+import type { ApiProvider, EnvOverrides, ProviderResponse, CallApiContextParams } from '../types';
+import { maybeLoadFromExternalFile, renderVarsInObject } from '../util';
+import { CHAT_MODELS } from './googleShared';
 import { parseChatPrompt, REQUEST_TIMEOUT_MS } from './shared';
+import { maybeCoerceToGeminiFormat } from './vertexUtil';
 
 const DEFAULT_API_HOST = 'generativelanguage.googleapis.com';
 
@@ -15,6 +19,7 @@ interface PalmCompletionOptions {
   topP?: number;
   topK?: number;
   generationConfig?: Record<string, any>;
+  responseSchema?: string;
 }
 
 class PalmGenericProvider implements ApiProvider {
@@ -47,8 +52,8 @@ class PalmGenericProvider implements ApiProvider {
       this.config.apiHost ||
       this.env?.GOOGLE_API_HOST ||
       this.env?.PALM_API_HOST ||
-      process.env.GOOGLE_API_HOST ||
-      process.env.PALM_API_HOST ||
+      getEnvString('GOOGLE_API_HOST') ||
+      getEnvString('PALM_API_HOST') ||
       DEFAULT_API_HOST
     );
   }
@@ -58,8 +63,8 @@ class PalmGenericProvider implements ApiProvider {
       this.config.apiKey ||
       this.env?.GOOGLE_API_KEY ||
       this.env?.PALM_API_KEY ||
-      process.env.GOOGLE_API_KEY ||
-      process.env.PALM_API_KEY
+      getEnvString('GOOGLE_API_KEY') ||
+      getEnvString('PALM_API_KEY')
     );
   }
 
@@ -70,19 +75,17 @@ class PalmGenericProvider implements ApiProvider {
 }
 
 export class PalmChatProvider extends PalmGenericProvider {
-  static CHAT_MODELS = ['chat-bison-001', 'gemini-pro', 'gemini-pro-vision'];
-
   constructor(
     modelName: string,
     options: { config?: PalmCompletionOptions; id?: string; env?: EnvOverrides } = {},
   ) {
-    if (!PalmChatProvider.CHAT_MODELS.includes(modelName)) {
-      logger.warn(`Using unknown Google chat model: ${modelName}`);
+    if (!CHAT_MODELS.includes(modelName)) {
+      logger.debug(`Using unknown Google chat model: ${modelName}`);
     }
     super(modelName, options);
   }
 
-  async callApi(prompt: string): Promise<ProviderResponse> {
+  async callApi(prompt: string, context?: CallApiContextParams): Promise<ProviderResponse> {
     if (!this.getApiKey()) {
       throw new Error(
         'Google API key is not set. Set the GOOGLE_API_KEY environment variable or add `apiKey` to the provider config.',
@@ -91,7 +94,7 @@ export class PalmChatProvider extends PalmGenericProvider {
 
     const isGemini = this.modelName.startsWith('gemini');
     if (isGemini) {
-      return this.callGemini(prompt);
+      return this.callGemini(prompt, context);
     }
 
     // https://developers.generativeai.google/tutorials/curl_quickstart
@@ -150,9 +153,11 @@ export class PalmChatProvider extends PalmGenericProvider {
     }
   }
 
-  async callGemini(prompt: string): Promise<ProviderResponse> {
-    const contents = parseChatPrompt(prompt, [{ parts: [{ text: prompt }] }]);
-    const body = {
+  async callGemini(prompt: string, context?: CallApiContextParams): Promise<ProviderResponse> {
+    const { contents, systemInstruction } = maybeCoerceToGeminiFormat(
+      parseChatPrompt(prompt, [{ content: prompt }]),
+    );
+    const body: Record<string, any> = {
       contents,
       generationConfig: {
         temperature: this.config.temperature,
@@ -163,7 +168,25 @@ export class PalmChatProvider extends PalmGenericProvider {
         ...this.config.generationConfig,
       },
       safetySettings: this.config.safetySettings,
+      ...(systemInstruction ? { system_instruction: systemInstruction } : {}),
     };
+
+    if (this.config.responseSchema) {
+      // If the `response_schema` has already been set by the client.
+      if (body.generationConfig.response_schema) {
+        throw new Error(
+          '`responseSchema` provided but `generationConfig.response_schema` already set.',
+        );
+      }
+
+      const schema = maybeLoadFromExternalFile(
+        renderVarsInObject(this.config.responseSchema, context?.vars),
+      );
+
+      body.generationConfig.response_schema = schema;
+      body.generationConfig.response_mime_type = 'application/json';
+    }
+
     logger.debug(`Calling Google API: ${JSON.stringify(body)}`);
 
     let data;

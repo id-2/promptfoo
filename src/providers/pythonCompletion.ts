@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { getCache, isCacheEnabled } from '../cache';
 import logger from '../logger';
-import { runPython } from '../python/wrapper';
+import { runPython } from '../python/pythonUtils';
 import type {
   ApiProvider,
   CallApiContextParams,
@@ -11,14 +11,17 @@ import type {
   ProviderEmbeddingResponse,
   ProviderClassificationResponse,
 } from '../types';
-import { parsePathOrGlob, safeJsonStringify, sha256 } from '../util';
+import { parsePathOrGlob } from '../util';
+import { sha256 } from '../util/createHash';
+import { safeJsonStringify } from '../util/json';
 
 interface PythonProviderConfig {
   pythonExecutable?: string;
 }
 
 export class PythonProvider implements ApiProvider {
-  private config: PythonProviderConfig;
+  config: PythonProviderConfig;
+
   private scriptPath: string;
   private functionName: string | null;
   public label: string | undefined;
@@ -52,7 +55,7 @@ export class PythonProvider implements ApiProvider {
     const fileHash = sha256(fs.readFileSync(absPath, 'utf-8'));
     const cacheKey = `python:${this.scriptPath}:${apiType}:${fileHash}:${prompt}:${JSON.stringify(
       this.options,
-    )}`;
+    )}:${JSON.stringify(context?.vars)}`;
     const cache = await getCache();
     let cachedResult;
 

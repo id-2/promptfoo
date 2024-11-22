@@ -2,29 +2,26 @@ import cacheManager from 'cache-manager';
 import type { Cache } from 'cache-manager';
 import fsStore from 'cache-manager-fs-hash';
 import fs from 'fs';
-import type { RequestInfo, RequestInit } from 'node-fetch';
 import path from 'path';
+import { getEnvBool, getEnvString, getEnvInt } from './envars';
 import { fetchWithRetries } from './fetch';
 import logger from './logger';
-import { getConfigDirectoryPath } from './util';
+import { REQUEST_TIMEOUT_MS } from './providers/shared';
+import { getConfigDirectoryPath } from './util/config/manage';
 
 let cacheInstance: Cache | undefined;
 
-let enabled =
-  typeof process.env.PROMPTFOO_CACHE_ENABLED === 'undefined'
-    ? true
-    : process.env.PROMPTFOO_CACHE_ENABLED === '1' ||
-      process.env.PROMPTFOO_CACHE_ENABLED === 'true' ||
-      process.env.PROMPTFOO_CACHE_ENABLED === 'yes';
+let enabled = getEnvBool('PROMPTFOO_CACHE_ENABLED', true);
 
 const cacheType =
-  process.env.PROMPTFOO_CACHE_TYPE || (process.env.NODE_ENV === 'test' ? 'memory' : 'disk');
+  getEnvString('PROMPTFOO_CACHE_TYPE') || (getEnvString('NODE_ENV') === 'test' ? 'memory' : 'disk');
 
 export function getCache() {
   if (!cacheInstance) {
     let cachePath = '';
     if (cacheType === 'disk' && enabled) {
-      cachePath = process.env.PROMPTFOO_CACHE_PATH || path.join(getConfigDirectoryPath(), 'cache');
+      cachePath =
+        getEnvString('PROMPTFOO_CACHE_PATH') || path.join(getConfigDirectoryPath(), 'cache');
       if (!fs.existsSync(cachePath)) {
         logger.info(`Creating cache folder at ${cachePath}.`);
         fs.mkdirSync(cachePath, { recursive: true });
@@ -33,10 +30,10 @@ export function getCache() {
     cacheInstance = cacheManager.caching({
       store: cacheType === 'disk' && enabled ? fsStore : 'memory',
       options: {
-        max: process.env.PROMPTFOO_CACHE_MAX_FILE_COUNT || 10_000, // number of files
+        max: getEnvInt('PROMPTFOO_CACHE_MAX_FILE_COUNT', 10_000), // number of files
         path: cachePath,
-        ttl: process.env.PROMPTFOO_CACHE_TTL || 60 * 60 * 24 * 14, // in seconds, 14 days
-        maxsize: process.env.PROMPTFOO_CACHE_MAX_SIZE || 1e7, // in bytes, 10mb
+        ttl: getEnvInt('PROMPTFOO_CACHE_TTL', 60 * 60 * 24 * 14), // in seconds, 14 days
+        maxsize: getEnvInt('PROMPTFOO_CACHE_MAX_SIZE', 1e7), // in bytes, 10mb
         //zip: true, // whether to use gzip compression
       },
     });
@@ -44,22 +41,34 @@ export function getCache() {
   return cacheInstance;
 }
 
-export async function fetchWithCache(
+export type FetchWithCacheResult<T> = {
+  data: T;
+  cached: boolean;
+  status: number;
+  statusText: string;
+  headers?: Record<string, string>;
+};
+
+export async function fetchWithCache<T = any>(
   url: RequestInfo,
   options: RequestInit = {},
-  timeout: number,
+  timeout: number = REQUEST_TIMEOUT_MS,
   format: 'json' | 'text' = 'json',
   bust: boolean = false,
-): Promise<{ data: any; cached: boolean }> {
+): Promise<FetchWithCacheResult<T>> {
   if (!enabled || bust) {
     const resp = await fetchWithRetries(url, options, timeout);
+
     const respText = await resp.text();
     try {
       return {
         cached: false,
         data: format === 'json' ? JSON.parse(respText) : respText,
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: Object.fromEntries(resp.headers.entries()),
       };
-    } catch (error) {
+    } catch {
       throw new Error(`Error parsing response as JSON: ${respText}`);
     }
   }
@@ -68,7 +77,7 @@ export async function fetchWithCache(
 
   const copy = Object.assign({}, options);
   delete copy.headers;
-  const cacheKey = `fetch:${url}:${JSON.stringify(copy)}`;
+  const cacheKey = `fetch:v2:${url}:${JSON.stringify(copy)}`;
 
   let cached = true;
   let errorResponse = null;
@@ -79,10 +88,26 @@ export async function fetchWithCache(
     cached = false;
     const response = await fetchWithRetries(url, options, timeout);
     const responseText = await response.text();
+    const headers = Object.fromEntries(response.headers.entries());
+
     try {
-      const data = JSON.stringify(format === 'json' ? JSON.parse(responseText) : responseText);
+      const data = JSON.stringify({
+        data: format === 'json' ? JSON.parse(responseText) : responseText,
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
       if (!response.ok) {
-        errorResponse = data;
+        if (responseText == '') {
+          errorResponse = JSON.stringify({
+            data: `Empty Response: ${response.status}: ${response.statusText}`,
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+          });
+        } else {
+          errorResponse = data;
+        }
         // Don't cache error responses
         return;
       }
@@ -105,9 +130,13 @@ export async function fetchWithCache(
     logger.debug(`Returning cached response for ${url}: ${cachedResponse}`);
   }
 
+  const parsedResponse = JSON.parse((cachedResponse ?? errorResponse) as string);
   return {
     cached,
-    data: JSON.parse((cachedResponse ?? errorResponse) as string),
+    data: parsedResponse.data as T,
+    status: parsedResponse.status,
+    statusText: parsedResponse.statusText,
+    headers: parsedResponse.headers,
   };
 }
 

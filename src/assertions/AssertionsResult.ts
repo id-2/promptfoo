@@ -1,9 +1,11 @@
-import { AssertionSet, GradingResult } from '../types';
+import { getEnvBool } from '../envars';
+import type { AssertionSet, GradingResult } from '../types';
 
 const DEFAULT_TOKENS_USED = {
   total: 0,
   prompt: 0,
   completion: 0,
+  cached: 0,
 };
 
 interface ParentAssertionSet {
@@ -68,10 +70,19 @@ export class AssertionsResult {
       this.namedScores[metric] = (this.namedScores[metric] || 0) + result.score;
     }
 
+    if (result.namedScores) {
+      Object.entries(result.namedScores).forEach(([metricName, score]) => {
+        if (metricName !== metric) {
+          this.namedScores[metricName] = (this.namedScores[metricName] || 0) + score;
+        }
+      });
+    }
+
     if (result.tokensUsed) {
       this.tokensUsed.total += result.tokensUsed.total || 0;
       this.tokensUsed.prompt += result.tokensUsed.prompt || 0;
       this.tokensUsed.completion += result.tokensUsed.completion || 0;
+      this.tokensUsed.cached += result.tokensUsed.cached || 0;
     }
 
     if (result.pass) {
@@ -80,7 +91,7 @@ export class AssertionsResult {
 
     this.failedReason = result.reason;
 
-    if (process.env.PROMPTFOO_SHORT_CIRCUIT_TEST_FAILURES) {
+    if (getEnvBool('PROMPTFOO_SHORT_CIRCUIT_TEST_FAILURES')) {
       throw new Error(result.reason);
     }
   }
@@ -90,10 +101,10 @@ export class AssertionsResult {
       return this.result;
     }
 
-    const score = this.totalScore / this.totalWeight;
+    const score = this.totalWeight > 0 ? this.totalScore / this.totalWeight : 0;
     let pass = !this.failedReason;
 
-    let reason = !this.failedReason ? 'All assertions passed' : this.failedReason;
+    let reason = this.failedReason ? this.failedReason : 'All assertions passed';
 
     if (this.threshold) {
       // Existence of a test threshold overrides the pass/fail status of individual assertions

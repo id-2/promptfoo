@@ -1,20 +1,32 @@
+import chalk from 'chalk';
+import dedent from 'dedent';
 import fs from 'fs';
 import yaml from 'js-yaml';
 import path from 'path';
 import invariant from 'tiny-invariant';
+import cliState from './cliState';
 import { importModule } from './esm';
 import logger from './logger';
+import {
+  AdalineGatewayChatProvider,
+  AdalineGatewayEmbeddingProvider,
+} from './providers/adaline.gateway';
+import { AI21ChatCompletionProvider } from './providers/ai21';
 import { AnthropicCompletionProvider, AnthropicMessagesProvider } from './providers/anthropic';
 import {
-  AzureOpenAiAssistantProvider,
-  AzureOpenAiChatCompletionProvider,
-  AzureOpenAiCompletionProvider,
-  AzureOpenAiEmbeddingProvider,
-} from './providers/azureopenai';
+  AzureAssistantProvider,
+  AzureChatCompletionProvider,
+  AzureCompletionProvider,
+  AzureEmbeddingProvider,
+} from './providers/azure';
 import { BAMChatProvider, BAMEmbeddingProvider } from './providers/bam';
 import { AwsBedrockCompletionProvider, AwsBedrockEmbeddingProvider } from './providers/bedrock';
+import { BrowserProvider } from './providers/browser';
 import * as CloudflareAiProviders from './providers/cloudflare-ai';
-import { CohereChatCompletionProvider } from './providers/cohere';
+import { CohereChatCompletionProvider, CohereEmbeddingProvider } from './providers/cohere';
+import { FalImageGenerationProvider } from './providers/fal';
+import { GolangProvider } from './providers/golangCompletion';
+import { GroqProvider } from './providers/groq';
 import { HttpProvider } from './providers/http';
 import {
   HuggingfaceFeatureExtractionProvider,
@@ -29,7 +41,8 @@ import {
   LocalAiChatProvider,
   LocalAiEmbeddingProvider,
 } from './providers/localai';
-import { MistralChatCompletionProvider } from './providers/mistral';
+import { ManualInputProvider } from './providers/manualInput';
+import { MistralChatCompletionProvider, MistralEmbeddingProvider } from './providers/mistral';
 import {
   OllamaEmbeddingProvider,
   OllamaCompletionProvider,
@@ -43,6 +56,7 @@ import {
   OpenAiImageProvider,
   OpenAiModerationProvider,
 } from './providers/openai';
+import { parsePackageProvider } from './providers/packageParser';
 import { PalmChatProvider } from './providers/palm';
 import { PortkeyChatCompletionProvider } from './providers/portkey';
 import { PythonProvider } from './providers/pythonCompletion';
@@ -52,16 +66,28 @@ import {
   ReplicateProvider,
 } from './providers/replicate';
 import { ScriptCompletionProvider } from './providers/scriptCompletion';
+import { SimulatedUser } from './providers/simulatedUser';
+import { createTogetherAiProvider } from './providers/togetherai';
 import { VertexChatProvider, VertexEmbeddingProvider } from './providers/vertex';
 import { VoyageEmbeddingProvider } from './providers/voyage';
+import { WatsonXProvider } from './providers/watsonx';
 import { WebhookProvider } from './providers/webhook';
+import { WebSocketProvider } from './providers/websocket';
+import { createXAIProvider } from './providers/xai';
+import RedteamCrescendoProvider from './redteam/providers/crescendo';
+import RedteamGoatProvider from './redteam/providers/goat';
+import RedteamIterativeProvider from './redteam/providers/iterative';
+import RedteamImageIterativeProvider from './redteam/providers/iterativeImage';
+import RedteamIterativeTreeProvider from './redteam/providers/iterativeTree';
+import type { TestSuiteConfig } from './types';
 import type {
   ApiProvider,
   EnvOverrides,
   ProviderOptions,
   ProviderOptionsMap,
-  TestSuiteConfig,
-} from './types';
+} from './types/providers';
+import { isJavascriptFile } from './util/file';
+import { getNunjucksEngine } from './util/templates';
 
 // FIXME(ian): Make loadApiProvider handle all the different provider types (string, ProviderOptions, ApiProvider, etc), rather than the callers.
 export async function loadApiProvider(
@@ -82,27 +108,44 @@ export async function loadApiProvider(
     env,
   };
   let ret: ApiProvider;
+  providerPath = getNunjucksEngine().renderString(providerPath, {});
   if (
     providerPath.startsWith('file://') &&
-    (providerPath.endsWith('.yaml') || providerPath.endsWith('.yml'))
+    (providerPath.endsWith('.yaml') ||
+      providerPath.endsWith('.yml') ||
+      providerPath.endsWith('.json'))
   ) {
     const filePath = providerPath.slice('file://'.length);
-    const yamlContent = yaml.load(fs.readFileSync(filePath, 'utf8')) as ProviderOptions;
-    invariant(yamlContent, `Provider config ${filePath} is undefined`);
-    invariant(yamlContent.id, `Provider config ${filePath} must have an id`);
-    logger.info(`Loaded provider ${yamlContent.id} from ${filePath}`);
-    ret = await loadApiProvider(yamlContent.id, { ...context, options: yamlContent });
+    const modulePath = path.isAbsolute(filePath)
+      ? filePath
+      : path.join(basePath || process.cwd(), filePath);
+    let fileContent: ProviderOptions;
+    if (providerPath.endsWith('.json')) {
+      fileContent = JSON.parse(fs.readFileSync(modulePath, 'utf8')) as ProviderOptions;
+    } else {
+      fileContent = yaml.load(fs.readFileSync(modulePath, 'utf8')) as ProviderOptions;
+    }
+    invariant(fileContent, `Provider config ${filePath} is undefined`);
+    invariant(fileContent.id, `Provider config ${filePath} must have an id`);
+    logger.info(`Loaded provider ${fileContent.id} from ${filePath}`);
+    ret = await loadApiProvider(fileContent.id, { ...context, options: fileContent });
   } else if (providerPath === 'echo') {
     ret = {
       id: () => 'echo',
-      callApi: async (input) => ({ output: input }),
+      callApi: async (input: string) => ({ output: input }),
     };
   } else if (providerPath.startsWith('exec:')) {
     // Load script module
     const scriptPath = providerPath.split(':')[1];
     ret = new ScriptCompletionProvider(scriptPath, providerOptions);
-  } else if (providerPath.startsWith('python:')) {
-    const scriptPath = providerPath.split(':').slice(1).join(':');
+  } else if (
+    providerPath.startsWith('python:') ||
+    (providerPath.startsWith('file://') &&
+      (providerPath.endsWith('.py') || providerPath.includes('.py:')))
+  ) {
+    const scriptPath = providerPath.startsWith('file://')
+      ? providerPath.slice('file://'.length)
+      : providerPath.split(':').slice(1).join(':');
     ret = new PythonProvider(scriptPath, providerOptions);
   } else if (providerPath.startsWith('openai:')) {
     // Load OpenAI module
@@ -111,13 +154,13 @@ export async function loadApiProvider(
     const modelName = splits.slice(2).join(':');
 
     if (modelType === 'chat') {
-      ret = new OpenAiChatCompletionProvider(modelName || 'gpt-3.5-turbo', providerOptions);
+      ret = new OpenAiChatCompletionProvider(modelName || 'gpt-4o-mini', providerOptions);
     } else if (modelType === 'embedding' || modelType === 'embeddings') {
       ret = new OpenAiEmbeddingProvider(modelName || 'text-embedding-3-large', providerOptions);
     } else if (modelType === 'completion') {
       ret = new OpenAiCompletionProvider(modelName || 'gpt-3.5-turbo-instruct', providerOptions);
     } else if (modelType === 'moderation') {
-      ret = new OpenAiModerationProvider(modelName || 'text-moderation-latest', providerOptions);
+      ret = new OpenAiModerationProvider(modelName || 'omni-moderation-latest', providerOptions);
     } else if (OpenAiChatCompletionProvider.OPENAI_CHAT_MODEL_NAMES.includes(modelType)) {
       ret = new OpenAiChatCompletionProvider(modelType, providerOptions);
     } else if (OpenAiCompletionProvider.OPENAI_COMPLETION_MODEL_NAMES.includes(modelType)) {
@@ -127,27 +170,26 @@ export async function loadApiProvider(
     } else if (modelType === 'image') {
       ret = new OpenAiImageProvider(modelName, providerOptions);
     } else {
-      throw new Error(
-        `Unknown OpenAI model type: ${modelType}. Use one of the following providers: openai:chat:<model name>, openai:completion:<model name>, openai:embeddings:<model name>, openai:image:<model name>`,
+      // Assume user did not provide model type, and it's a chat model
+      logger.warn(
+        `Unknown OpenAI model type: ${modelType}. Treating it as a chat model. Use one of the following providers: openai:chat:<model name>, openai:completion:<model name>, openai:embeddings:<model name>, openai:image:<model name>`,
       );
+      ret = new OpenAiChatCompletionProvider(modelType, providerOptions);
     }
-  } else if (providerPath.startsWith('azureopenai:')) {
+  } else if (providerPath.startsWith('azure:') || providerPath.startsWith('azureopenai:')) {
     // Load Azure OpenAI module
     const splits = providerPath.split(':');
     const modelType = splits[1];
     const deploymentName = splits[2];
 
     if (modelType === 'chat') {
-      ret = new AzureOpenAiChatCompletionProvider(deploymentName, providerOptions);
+      ret = new AzureChatCompletionProvider(deploymentName, providerOptions);
     } else if (modelType === 'assistant') {
-      ret = new AzureOpenAiAssistantProvider(deploymentName, providerOptions);
+      ret = new AzureAssistantProvider(deploymentName, providerOptions);
     } else if (modelType === 'embedding' || modelType === 'embeddings') {
-      ret = new AzureOpenAiEmbeddingProvider(
-        deploymentName || 'text-embedding-ada-002',
-        providerOptions,
-      );
+      ret = new AzureEmbeddingProvider(deploymentName || 'text-embedding-ada-002', providerOptions);
     } else if (modelType === 'completion') {
-      ret = new AzureOpenAiCompletionProvider(deploymentName, providerOptions);
+      ret = new AzureCompletionProvider(deploymentName, providerOptions);
     } else {
       throw new Error(
         `Unknown Azure OpenAI model type: ${modelType}. Use one of the following providers: azureopenai:chat:<model name>, azureopenai:assistant:<assistant id>, azureopenai:completion:<model name>`,
@@ -163,6 +205,27 @@ export async function loadApiProvider(
         apiBaseUrl: 'https://openrouter.ai/api/v1',
         apiKeyEnvar: 'OPENROUTER_API_KEY',
       },
+    });
+  } else if (providerPath.startsWith('github:')) {
+    const splits = providerPath.split(':');
+    const modelName = splits.slice(1).join(':');
+    ret = new OpenAiChatCompletionProvider(modelName, {
+      ...providerOptions,
+      config: {
+        ...providerOptions.config,
+        apiBaseUrl: 'https://models.inference.ai.azure.com',
+        apiKeyEnvar: 'GITHUB_TOKEN',
+      },
+    });
+  } else if (providerPath.startsWith('togetherai:')) {
+    ret = createTogetherAiProvider(providerPath, {
+      config: providerOptions,
+      env: context.env,
+    });
+  } else if (providerPath.startsWith('xai:')) {
+    ret = createXAIProvider(providerPath, {
+      config: providerOptions,
+      env: context.env,
     });
   } else if (providerPath.startsWith('portkey:')) {
     const splits = providerPath.split(':');
@@ -186,6 +249,10 @@ export async function loadApiProvider(
     }
   } else if (providerPath.startsWith('voyage:')) {
     ret = new VoyageEmbeddingProvider(providerPath.split(':')[1], providerOptions);
+  } else if (providerPath.startsWith('watsonx:')) {
+    const splits = providerPath.split(':');
+    const modelName = splits.slice(1).join(':');
+    ret = new WatsonXProvider(modelName, providerOptions);
   } else if (providerPath.startsWith('bedrock:')) {
     const splits = providerPath.split(':');
     const modelType = splits[1];
@@ -240,6 +307,15 @@ export async function loadApiProvider(
         providerOptions,
       );
     }
+  } else if (providerPath.startsWith('fal:')) {
+    const [_, modelType, modelName] = providerPath.split(':');
+    if (modelType === 'image') {
+      ret = new FalImageGenerationProvider(modelName, providerOptions);
+    } else {
+      throw new Error(
+        `Invalid fal provider path: ${providerPath}. Use one of the following providers: fal:image:<model name>`,
+      );
+    }
   } else if (providerPath.startsWith('bam:')) {
     const splits = providerPath.split(':');
     const modelType = splits[1];
@@ -283,12 +359,6 @@ export async function loadApiProvider(
   } else if (providerPath === 'llama' || providerPath.startsWith('llama:')) {
     const modelName = providerPath.split(':')[1];
     ret = new LlamaProvider(modelName, providerOptions);
-  } else if (
-    providerPath.startsWith('ollama:embeddings:') ||
-    providerPath.startsWith('ollama:embedding:')
-  ) {
-    const modelName = providerPath.split(':')[2];
-    ret = new OllamaEmbeddingProvider(modelName, providerOptions);
   } else if (providerPath.startsWith('ollama:')) {
     const splits = providerPath.split(':');
     const firstPart = splits[1];
@@ -298,6 +368,9 @@ export async function loadApiProvider(
     } else if (firstPart === 'completion') {
       const modelName = splits.slice(2).join(':');
       ret = new OllamaCompletionProvider(modelName, providerOptions);
+    } else if (firstPart === 'embedding' || firstPart === 'embeddings') {
+      const modelName = splits.slice(2).join(':');
+      ret = new OllamaEmbeddingProvider(modelName, providerOptions);
     } else {
       // Default to completion provider
       const modelName = splits.slice(1).join(':');
@@ -318,11 +391,30 @@ export async function loadApiProvider(
       ret = new VertexChatProvider(splits.slice(1).join(':'), providerOptions);
     }
   } else if (providerPath.startsWith('mistral:')) {
-    const modelName = providerPath.split(':')[1];
-    ret = new MistralChatCompletionProvider(modelName, providerOptions);
+    const splits = providerPath.split(':');
+    const modelType = splits[1];
+    const modelName = splits.slice(2).join(':');
+    if (modelType === 'embedding' || modelType === 'embeddings') {
+      ret = new MistralEmbeddingProvider(providerOptions);
+    } else {
+      ret = new MistralChatCompletionProvider(modelName || modelType, providerOptions);
+    }
   } else if (providerPath.startsWith('cohere:')) {
-    const modelName = providerPath.split(':')[1];
-    ret = new CohereChatCompletionProvider(modelName, providerOptions);
+    const splits = providerPath.split(':');
+    const modelType = splits[1];
+    const modelName = splits.slice(2).join(':');
+
+    if (modelType === 'embedding' || modelType === 'embeddings') {
+      ret = new CohereEmbeddingProvider(modelName, providerOptions);
+    } else if (modelType === 'chat' || modelType === undefined) {
+      ret = new CohereChatCompletionProvider(modelName || modelType, providerOptions);
+    } else {
+      // Default to chat provider for any other model type
+      ret = new CohereChatCompletionProvider(
+        providerPath.substring('cohere:'.length),
+        providerOptions,
+      );
+    }
   } else if (providerPath.startsWith('localai:')) {
     const splits = providerPath.split(':');
     const modelType = splits[1];
@@ -337,18 +429,71 @@ export async function loadApiProvider(
     } else {
       ret = new LocalAiChatProvider(modelType, providerOptions);
     }
-  } else if (providerPath.startsWith('http:') || providerPath.startsWith('https:')) {
+  } else if (providerPath.startsWith('adaline:')) {
+    const splits = providerPath.split(':');
+    if (splits.length < 4) {
+      throw new Error(
+        `Invalid adaline provider path: ${providerPath}. path format should be 'adaline:<provider_name>:<model_type>:<model_name>' eg. 'adaline:openai:chat:gpt-4o'`,
+      );
+    }
+    const providerName = splits[1];
+    const modelType = splits[2];
+    const modelName = splits[3];
+
+    if (modelType === 'embedding' || modelType === 'embeddings') {
+      ret = new AdalineGatewayEmbeddingProvider(providerName, modelName, providerOptions);
+    } else {
+      ret = new AdalineGatewayChatProvider(providerName, modelName, providerOptions);
+    }
+  } else if (
+    providerPath.startsWith('http:') ||
+    providerPath.startsWith('https:') ||
+    providerPath === 'http' ||
+    providerPath === 'https'
+  ) {
     ret = new HttpProvider(providerPath, providerOptions);
+  } else if (
+    providerPath.startsWith('ws:') ||
+    providerPath.startsWith('wss:') ||
+    providerPath === 'websocket' ||
+    providerPath === 'ws' ||
+    providerPath === 'wss'
+  ) {
+    ret = new WebSocketProvider(providerPath, providerOptions);
+  } else if (providerPath === 'browser') {
+    ret = new BrowserProvider(providerPath, providerOptions);
+  } else if (providerPath === 'promptfoo:manual-input') {
+    ret = new ManualInputProvider(providerOptions);
+  } else if (providerPath === 'promptfoo:redteam:crescendo') {
+    ret = new RedteamCrescendoProvider(providerOptions.config);
+  } else if (providerPath === 'promptfoo:redteam:goat') {
+    ret = new RedteamGoatProvider(providerOptions.config);
   } else if (providerPath === 'promptfoo:redteam:iterative') {
-    const RedteamIterativeProvider = (await import(path.join(__dirname, './redteam/iterative')))
-      .default;
-    ret = new RedteamIterativeProvider(providerOptions);
+    ret = new RedteamIterativeProvider(providerOptions.config);
   } else if (providerPath === 'promptfoo:redteam:iterative:image') {
-    const RedteamIterativeProvider = (
-      await import(path.join(__dirname, './redteam/iterativeImage'))
-    ).default;
-    ret = new RedteamIterativeProvider(providerOptions);
-  } else {
+    ret = new RedteamImageIterativeProvider(providerOptions.config);
+  } else if (providerPath === 'promptfoo:redteam:iterative:tree') {
+    ret = new RedteamIterativeTreeProvider(providerOptions.config);
+  } else if (providerPath === 'promptfoo:simulated-user') {
+    ret = new SimulatedUser(providerOptions);
+  } else if (providerPath.startsWith('groq:')) {
+    const modelName = providerPath.split(':')[1];
+    ret = new GroqProvider(modelName, providerOptions);
+  } else if (providerPath.startsWith('ai21:')) {
+    const modelName = providerPath.split(':')[1];
+    ret = new AI21ChatCompletionProvider(modelName, providerOptions);
+  } else if (
+    providerPath.startsWith('golang:') ||
+    (providerPath.startsWith('file://') &&
+      (providerPath.endsWith('.go') || providerPath.includes('.go:')))
+  ) {
+    const scriptPath = providerPath.startsWith('file://')
+      ? providerPath.slice('file://'.length)
+      : providerPath.split(':').slice(1).join(':');
+    ret = new GolangProvider(scriptPath, providerOptions);
+  } else if (providerPath.startsWith('package:')) {
+    ret = await parsePackageProvider(providerPath, basePath || process.cwd(), providerOptions);
+  } else if (isJavascriptFile(providerPath)) {
     if (providerPath.startsWith('file://')) {
       providerPath = providerPath.slice('file://'.length);
     }
@@ -356,12 +501,23 @@ export async function loadApiProvider(
     const modulePath = path.isAbsolute(providerPath)
       ? providerPath
       : path.join(basePath || process.cwd(), providerPath);
+
     const CustomApiProvider = await importModule(modulePath);
     ret = new CustomApiProvider(options);
+  } else {
+    logger.error(dedent`
+      Could not identify provider: ${chalk.bold(providerPath)}.
+
+      ${chalk.white(dedent`
+        Please check your configuration and ensure the provider is correctly specified.
+
+        For more information on supported providers, visit: `)} ${chalk.cyan('https://promptfoo.dev/docs/providers/')}
+    `);
+    process.exit(1);
   }
   ret.transform = options.transform;
   ret.delay = options.delay;
-  ret.label ||= options.label;
+  ret.label ||= getNunjucksEngine().renderString(String(options.label || ''), {});
   return ret;
 }
 
@@ -372,7 +528,8 @@ export async function loadApiProviders(
     env?: EnvOverrides;
   } = {},
 ): Promise<ApiProvider[]> {
-  const { basePath, env } = options;
+  const { basePath } = options;
+  const env = options.env || cliState.config?.env;
   if (typeof providerPaths === 'string') {
     return [await loadApiProvider(providerPaths, { basePath, env })];
   } else if (typeof providerPaths === 'function') {
@@ -416,12 +573,61 @@ export default {
   OpenAiCompletionProvider,
   OpenAiChatCompletionProvider,
   OpenAiAssistantProvider,
+  OpenAiEmbeddingProvider,
+  OpenAiImageProvider,
+  OpenAiModerationProvider,
   AnthropicCompletionProvider,
   AnthropicMessagesProvider,
   ReplicateProvider,
+  ReplicateImageProvider,
+  ReplicateModerationProvider,
   LocalAiCompletionProvider,
   LocalAiChatProvider,
+  LocalAiEmbeddingProvider,
   BAMChatProvider,
   BAMEmbeddingProvider,
+  GroqProvider,
+  MistralChatCompletionProvider,
+  MistralEmbeddingProvider,
+  AI21ChatCompletionProvider,
+  AzureAssistantProvider,
+  AzureChatCompletionProvider,
+  AzureCompletionProvider,
+  AzureEmbeddingProvider,
+
+  // Backwards compatibility for Azure rename 2024-11-09 / 0.96.0
+  AzureOpenAiAssistantProvider: AzureAssistantProvider,
+  AzureOpenAiChatCompletionProvider: AzureChatCompletionProvider,
+  AzureOpenAiCompletionProvider: AzureCompletionProvider,
+  AzureOpenAiEmbeddingProvider: AzureEmbeddingProvider,
+
+  AwsBedrockCompletionProvider,
+  AwsBedrockEmbeddingProvider,
+  BrowserProvider,
+  CohereChatCompletionProvider,
+  CohereEmbeddingProvider,
+  FalImageGenerationProvider,
+  GolangProvider,
+  HttpProvider,
+  HuggingfaceFeatureExtractionProvider,
+  HuggingfaceSentenceSimilarityProvider,
+  HuggingfaceTextClassificationProvider,
+  HuggingfaceTextGenerationProvider,
+  HuggingfaceTokenExtractionProvider,
+  LlamaProvider,
+  ManualInputProvider,
+  OllamaEmbeddingProvider,
+  OllamaCompletionProvider,
+  OllamaChatProvider,
+  PalmChatProvider,
+  PortkeyChatCompletionProvider,
+  PythonProvider,
+  ScriptCompletionProvider,
+  VertexChatProvider,
+  VertexEmbeddingProvider,
+  VoyageEmbeddingProvider,
+  WebhookProvider,
+  WebSocketProvider,
   loadApiProvider,
+  WatsonXProvider,
 };

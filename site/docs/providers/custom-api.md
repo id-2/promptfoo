@@ -9,14 +9,15 @@ To create a custom API provider, implement the `ApiProvider` interface in a sepa
 ```ts
 export interface CallApiContextParams {
   vars: Record<string, string | object>;
+  prompt: Prompt;
+  // Used when provider is overridden on the test case.
+  originalProvider?: ApiProvider;
+  logger?: winston.Logger;
 }
 
 export interface CallApiOptionsParams {
   // Whether to include logprobs in API response (used with OpenAI providers)
   includeLogProbs?: boolean;
-
-  // Used when provider is overridden on the test case.
-  originalProvider?: ApiProvider;
 }
 
 export interface ApiProvider {
@@ -44,8 +45,21 @@ export interface ApiProvider {
   // Applied by the evaluator on provider response
   transform?: string;
 
-  // Custom delay for the provider.
+  // Custom delay for the provider
   delay?: number;
+
+  // Provider configuration
+  config?: any;
+}
+
+export interface ProviderResponse {
+  cached?: boolean;
+  cost?: number;
+  error?: string;
+  logProbs?: number[];
+  metadata?: Record<string, any>;
+  output?: string | any;
+  tokenUsage?: TokenUsage;
 }
 ```
 
@@ -56,9 +70,6 @@ See also: [ProviderResponse](/docs/configuration/reference/#providerresponse)
 Here's an example of a custom API provider that returns a predefined output along with token usage:
 
 ```javascript
-// customApiProvider.js
-import fetch from 'node-fetch';
-
 class CustomApiProvider {
   constructor(options) {
     // Provider ID can be overridden by the config file (e.g. when using multiple of the same provider)
@@ -95,6 +106,64 @@ class CustomApiProvider {
 module.exports = CustomApiProvider;
 ```
 
+Custom API providers can also be used for embeddings, classification, similarity, or moderation.
+
+```javascript
+module.exports = class CustomApiProvider {
+  constructor(options) {
+    this.providerId = options.id || 'custom provider';
+    this.config = options.config;
+  }
+
+  id() {
+    return this.providerId;
+  }
+
+  // Embeddings
+  async callEmbeddingApi(prompt) {
+    // Add your custom embedding logic here
+    return {
+      embedding: [], // Your embedding array
+      tokenUsage: { total: 10, prompt: 1, completion: 0 },
+    };
+  }
+
+  // Classification
+  async callClassificationApi(prompt) {
+    // Add your custom classification logic here
+    return {
+      classification: {
+        classA: 0.6,
+        classB: 0.4,
+      },
+    };
+  }
+
+  // Similarity
+  async callSimilarityApi(reference, input) {
+    // Add your custom similarity logic here
+    return {
+      similarity: 0.85,
+      tokenUsage: { total: 10, prompt: 5, completion: 5 },
+    };
+  }
+
+  // Moderation
+  async callModerationApi(prompt, response) {
+    // Add your custom moderation logic here
+    return {
+      flags: [
+        {
+          code: 'inappropriate',
+          description: 'Potentially inappropriate content',
+          confidence: 0.7,
+        },
+      ],
+    };
+  }
+};
+```
+
 ### Caching
 
 You can interact with promptfoo's cache by importing the `promptfoo.cache` module. For example:
@@ -122,7 +191,7 @@ const { data, cached } = await promptfoo.cache.fetchWithCache(
     },
     body: JSON.stringify(body),
   },
-  10_000 /* 10 second timeout */,
+  10_000, // 10 second timeout
 );
 
 console.log('Got from OpenAI:', data);
@@ -134,18 +203,19 @@ console.log('Was it cached?', cached);
 Include the custom provider in promptfoo config:
 
 ```yaml
-providers: ['file://relative/path/to/customApiProvider.js']
+providers:
+  - 'file://relative/path/to/customApiProvider.js'
 ```
 
 Alternatively, you can pass the path to the custom API provider directly in the CLI:
 
 ```
-promptfoo eval -p prompt1.txt prompt2.txt -o results.csv  -v vars.csv -r ./customApiProvider.js
+promptfoo eval -p prompt1.txt prompt2.txt -o results.csv -v vars.csv -r ./customApiProvider.js
 ```
 
 This command will evaluate the prompts using the custom API provider and save the results to the specified CSV file.
 
-A full working example is available in the [examples directory](https://github.com/promptfoo/promptfoo/tree/main/examples/custom-provider).
+Full working examples of a [custom provider](https://github.com/promptfoo/promptfoo/tree/main/examples/custom-provider) and [custom provider embeddings](https://github.com/promptfoo/promptfoo/tree/main/examples/custom-provider-embeddings) are available in the [examples directory](https://github.com/promptfoo/promptfoo/tree/main/examples).
 
 ## Multiple instances of the same provider
 
@@ -166,3 +236,19 @@ providers:
 ### ES modules
 
 ES modules are supported, but must have a `.mjs` file extension. Alternatively, if you are transpiling Javascript or Typescript, we recommend pointing promptfoo to the transpiled plain Javascript output.
+
+### Environment Variable Overrides
+
+Custom providers can access environment variables through the `EnvOverrides` type. This allows you to override default API endpoints, keys, and other configuration options. Here's a partial list of available overrides:
+
+```ts
+export type EnvOverrides = {
+  OPENAI_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
+  AZURE_OPENAI_API_KEY?: string;
+  COHERE_API_KEY?: string;
+  // ... and many more
+};
+```
+
+You can access these overrides in your custom provider through the `options.config.env` object.
